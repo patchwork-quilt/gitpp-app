@@ -18,7 +18,17 @@ measurement; until then, nothing here should be quoted as observed.*
   update one Check run. Posting the Check costs ~2 API calls
   (create + complete) under every collection shape below.
 - Budget: GitHub's primary REST limit for a GitHub App installation,
-  **5,000 requests/hour**, is the ceiling that matters. Secondary
+  **5,000 requests/hour**, is the ceiling that matters. *(Correction,
+  2026-10-21, from the verified platform facts in the programme
+  record: 5,000/hr is the documented MINIMUM for an installation
+  token — it scales +50/hr per repo beyond 20 and +50/hr per org
+  user beyond 20, to a 12,500/hr cap (15,000 on GHEC) — so this
+  model is conservative on the primary limit. The limit that binds
+  the check-posting side is the SECONDARY one: 80
+  content-generating requests/minute, 500/hour. At ~900 derivations
+  a day the posting budget fits only if derivation coalesces per
+  commit instead of firing per event; burst coalescing is therefore
+  a hard design requirement, not an optimisation.)* Secondary
   (concurrency/burst) limits exist and are *ignored* by this model —
   they only make the REST column worse.
 - Traffic: 300 pull requests/day against the installation, each

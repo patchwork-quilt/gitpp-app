@@ -54,6 +54,12 @@ is modelled in [BUDGET.md](BUDGET.md).
 
 ## Registration runbook (the owner, once)
 
+**Timing: the whole flow — click, GitHub's confirmation, and the
+callback exchange — must complete within one hour** (GitHub expires
+the manifest code). Start it when you have ten unhurried minutes;
+it takes two.
+
+
 1. Open <https://gitpp-app.superinstance.dev>. Read the manifest on
    the page — it is byte-identical to `manifest.json` here; the
    deploy script refuses to deploy if they drift.
