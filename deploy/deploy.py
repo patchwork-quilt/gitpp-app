@@ -72,6 +72,10 @@ def main():
         except urllib.error.HTTPError as e:
             out = json.loads(e.read())
         print("bindings patch:", out.get("success"), "| errors:", out.get("errors"))
+        if not out.get("success"):
+            print("bindings patch FAILED — the upload is live but its "
+                  "bindings are not attached; deploy is INCOMPLETE")
+            return 1
 
     domains = cf_oauth.request(
         "GET", f"/client/v4/accounts/{ACCOUNT}/workers/domains"

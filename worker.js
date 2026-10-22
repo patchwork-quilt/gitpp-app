@@ -1,34 +1,44 @@
 // gitpp-app — the GitHub App receiver for git.pp.
 //
-// DARK BY DESIGN: no GitHub App is registered yet. This Worker is the
-// receiving half, deployed ahead of registration so the owner's single
-// click (the App Manifest flow, from the landing page below) has
-// somewhere real to land. Until the conversion callback stores the new
-// App's record in the CREDS KV namespace, the webhook endpoint answers
+// LIVE: the GitHub App this receiver serves is registered — gitpp-app,
+// app 5419092, owned by the patchwork-quilt org — and installed on
+// patchwork-quilt/gitpp-demo-quilt. Its record (id, webhook secret,
+// private key, installation id) lives in the CREDS KV namespace under
+// "app"; no secret value ever appears in a response or a log.
+//
+// The honest dark state remains for fresh deployments: until a
+// registration callback stores an App record in CREDS, /health
+// answers {"status":"dark",...} and the webhook endpoint answers
 // 503 "not configured" — that is the honest state, not an error.
 //
-// What this file does today:
-//   GET  /               landing page + the registration form. The page
-//                        renders the exact manifest JSON that the form
-//                        will POST to GitHub, so the human sees precisely
-//                        what they are creating before clicking.
+// What this file does:
+//   GET  /               landing page + the manifest a fork would
+//                        register with. The page renders the exact
+//                        manifest JSON, so a human sees precisely what
+//                        a registration click would create.
 //   GET|POST /setup/callback?code=...
 //                        the manifest-flow conversion: exchanges the
 //                        temporary code and stores the FULL conversion
 //                        JSON in CREDS under "app". The rendered page
 //                        shows only success, the app id, its html_url,
-//                        and the owner login — no secret value ever
-//                        appears in a response or a log.
+//                        and the owner login. REFUSES (409) when an
+//                        "app" record already exists — replacing a
+//                        live app's credentials must be a deliberate
+//                        operator action (clear the store first),
+//                        never a side effect of a stray redirect.
 //   POST /webhook        signature-verified event intake. The webhook
 //                        secret is read from the stored CREDS "app"
-//                        record. Verified events are appended to a
-//                        capped ring in CREDS under "events" (202), and
-//                        push / check_suite events trigger derivation
-//                        behind the ack (see DERIVATION LOOP below): the
-//                        repo's .gitpp records are fetched as a tarball,
+//                        record. Verified events are appended to the
+//                        event log in CREDS — one key per entry,
+//                        "evt:<timestamp>:<rand>", read via /events —
+//                        and answered 202; push / check_suite events
+//                        then trigger derivation behind the ack (see
+//                        DERIVATION LOOP below): the repo's .gitpp
+//                        records are fetched as a tarball, gated,
 //                        folded, and posted back as an advisory Check.
-//   GET  /events         the recorded event ring, as JSON. Public by
-//                        design for the dogfood phase (see README).
+//   GET  /events         the recorded event log, as JSON (last 20,
+//                        newest last). Public by design for the
+//                        dogfood phase (see README).
 //   GET  /health         {"status":"dark",...} until CREDS holds an
 //                        "app" record, then {"status":"live",...}.
 //
@@ -64,7 +74,7 @@ function esc(s) {
     .replaceAll('"', "&quot;");
 }
 
-function page(title, body) {
+function page(title, body, status = 200) {
   return new Response(
     `<!doctype html>
 <html lang="en">
@@ -85,6 +95,7 @@ ${body}
 </body>
 </html>`,
     {
+      status,
       headers: {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
@@ -110,7 +121,7 @@ ring.</p>
 <p>gitpp-app brings git.pp to GitHub: when agents and humans complete
 work concurrently against the same shared state — configuration keys, task
 claims, release freezes — it derives one deterministic state from their
-provenance-carrying records and posts it as a Check on the pull request:
+provenance-carrying records and posts it as a Check on the pushed commit:
 the winning value, the preserved losers, and the ancestry that decided.
 It resolves labelled key conflicts mechanically; it does not settle
 semantic conflicts.</p>
@@ -126,7 +137,7 @@ it does not change this instance.</p>
 <tr><th>Permission</th><th>Level</th><th>Why</th></tr>
 <tr><td>Metadata</td><td>Read</td><td>Platform baseline: which repos exist, who installed the app.</td></tr>
 <tr><td>Contents</td><td>Read</td><td>To read the record files. GitHub grants Contents repository-wide; there is no narrower grant. The app touches record paths only as a matter of published policy and open source — the limit is policy, not the grant, and this page says so in those words.</td></tr>
-<tr><td>Checks</td><td>Write</td><td>To post the derived state as a Check run on pull requests.</td></tr>
+<tr><td>Checks</td><td>Write</td><td>To post the derived state as a Check run on the pushed commit.</td></tr>
 </table>
 <p>Nothing else. No pull-request permission (the ancestry rides in the
 Check's own output), no administration, no repository creation, no
@@ -148,12 +159,14 @@ site.</p>`,
   );
 }
 
-// UNTESTED BY DESIGN: this path can only be exercised by a real
-// registration click (GitHub issues the code only inside the manifest
-// flow, and each code is single-use). It will be verified on the day the
-// owner clicks — the runbook in README.md covers what to expect. Until
-// then it sits dark, like the rest of the app, and fails closed: a
-// missing or rejected code shows an error page and nothing else.
+// Exercised by the real registration of this instance (2026-10-21 —
+// see README, "How this instance was registered"); each manifest code
+// is single-use and issued only inside GitHub's manifest flow. The
+// guard below makes the path one-shot per store: while an "app"
+// record exists, the callback refuses (409) and stores nothing —
+// replacing a live app's credentials is a deliberate operator action
+// (clear the store first), never a side effect of a stray redirect.
+// A missing or rejected code shows an error page and stores nothing.
 //
 // On success the FULL conversion JSON is stored in CREDS under "app"
 // and the page renders only non-secret fields. Secret values from the
@@ -168,6 +181,20 @@ async function setupCallback(url, env) {
 anything in the seconds after GitHub redirects here from a real App
 Manifest registration. Arriving here directly is expected to fail, and
 it just did — closed, by design.</p>`,
+    );
+  }
+  const existing = await storedApp(env);
+  if (existing) {
+    return page(
+      "gitpp-app — already registered",
+      `<h1>Already registered</h1>
+<p class="warn">This instance already holds an App record (app
+${esc(existing.id ?? "?")}), so this callback stored nothing.
+Re-registration would silently replace a live app's credentials; if
+that is really the intent, clear the <code>app</code> record from the
+credential store deliberately first, then run the manifest flow
+again.</p>`,
+      409,
     );
   }
   let conv;
@@ -296,17 +323,12 @@ async function webhook(request, env, ctx) {
     installation: payload?.installation?.id ?? null,
     action: payload?.action ?? null,
   };
-  let ring = [];
+  // Record the delivery — one KV key per entry (see appendRing), so
+  // simultaneous deliveries cannot overwrite each other. A store
+  // failure here must never fail the webhook: swallow and move on.
   try {
-    const raw = await env.CREDS.get("events");
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) ring = parsed;
-  } catch {
-    ring = [];
-  }
-  ring.push(entry);
-  ring = ring.slice(-20);
-  await env.CREDS.put("events", JSON.stringify(ring));
+    await appendRing(env, entry);
+  } catch {}
   console.log(JSON.stringify({ app: "gitpp-app", ...entry }));
   // Derivation runs BEHIND the ack: GitHub allows webhook receivers 10
   // seconds, and minting a token + fetching a tarball + folding does not
@@ -316,17 +338,34 @@ async function webhook(request, env, ctx) {
 }
 
 async function events(env) {
-  let ring = [];
+  const out = [];
   if (env.CREDS) {
+    // Legacy entries: the pre-2026-10-22 ring was one read-modify-write
+    // array under "events". Those entries all predate the per-entry
+    // keys below, so they merge first, in their stored order.
     try {
       const raw = await env.CREDS.get("events");
       const parsed = raw ? JSON.parse(raw) : [];
-      if (Array.isArray(parsed)) ring = parsed;
-    } catch {
-      ring = [];
-    }
+      if (Array.isArray(parsed)) out.push(...parsed);
+    } catch {}
+    // Per-entry keys "evt:<ISO timestamp>:<rand>": list() returns keys
+    // in lexicographic order, which is chronological for ISO stamps.
+    try {
+      let cursor;
+      for (let pageN = 0; pageN < 10; pageN++) {
+        const res = await env.CREDS.list({ prefix: "evt:", cursor });
+        for (const k of res.keys) {
+          try {
+            const v = await env.CREDS.get(k.name);
+            if (v) out.push(JSON.parse(v));
+          } catch {}
+        }
+        if (res.list_complete || !res.cursor) break;
+        cursor = res.cursor;
+      }
+    } catch {}
   }
-  return Response.json(ring);
+  return Response.json(out.slice(-20));
 }
 
 // ============================================================================
@@ -1314,25 +1353,31 @@ function witnessFreshness(records) {
 // On a verified push / check_suite (requested|rerequested) event, behind
 // the 202 ack (GitHub gives webhook receivers 10 seconds; derivation
 // lives in ctx.waitUntil), this Worker:
-//   1. mints an installation token (App JWT, RS256, from the stored PEM);
+//   1. mints an installation token (App JWT, RS256, from the stored PEM;
+//      tokens are cached per installation while >60s of life remains);
 //   2. fetches the repo tarball at the head sha in ONE call and extracts
 //      any .gitpp/records/*.json + .gitpp/project.json from it;
-//   3. folds the records with the vendored derive() below;
-//   4. posts the result as an advisory Check run (conclusion: neutral).
-// Coalescing: CREDS key `derived:<repo>:<sha>` is claimed before work
-// starts and kept after a successful post (TTL 24h), so push +
-// check_suite for one commit yield ONE check run. A repo with no
-// .gitpp/records surface is skipped quietly — absence is not an error.
-// Derivation failures are recorded in the events ring and NEVER fail
-// the webhook response.
+//   3. GATES every record (plain object, sane id/parents/effects/kind —
+//      a bad file is rejected BY NAME, never silently dropped, and a
+//      gate reject never kills the other records' derivation);
+//   4. folds the surviving records with the vendored derive();
+//   5. posts the result as an advisory Check run (conclusion: neutral;
+//      "failure" only when the input could not be read at all).
+// Coalescing: CREDS holds an in-flight claim `inflight:<repo>:<sha>`
+// (TTL 10 min) and a posted marker `posted:<repo>:<sha>` (TTL 24h),
+// and every post is preceded by a GitHub-side check for an existing
+// "git.pp state" run on the commit — so push + check_suite for one
+// commit yield ONE check run even if the KV claims race. A repo with
+// no .gitpp/records surface is skipped quietly — absence is not an
+// error. Derivation failures are recorded in the event log, surfaced
+// as a failure Check whenever a token is held, and NEVER fail the
+// webhook response.
 // ============================================================================
 
 const QUALIFICATIONS =
   "Mechanical resolution of labelled key conflicts only; the fold does " +
   "not settle semantic conflicts. Digests authenticate content, not " +
   "authorship. Arrival order is never an input.";
-
-const REPORT_CLASS_RANK = { override: 0, task: 1, witness: 2 };
 
 function fmtValue(v) {
   return typeof v === "string" ? v : JSON.stringify(v);
@@ -1342,70 +1387,234 @@ function kindOf(rec) {
   return typeof rec?.kind === "string" ? rec.kind : "witness";
 }
 
+/** Transitive ancestors of a record, within the given record set. */
+function ancestorIds(id, byId) {
+  const out = new Set();
+  const stack = [...(byId.get(id)?.parents ?? [])];
+  while (stack.length > 0) {
+    const cur = String(stack.pop());
+    if (out.has(cur)) continue;
+    const rec = byId.get(cur);
+    if (!rec) continue;
+    out.add(cur);
+    for (const p of rec.parents ?? []) stack.push(p);
+  }
+  return out;
+}
+
+/** The fold's tie-break inputs for one candidate, computed from the
+ * parents graph: how many of its ancestors carry non-witness ("intent")
+ * rank vs witness rank. This mirrors the vendored derive() exactly —
+ * among incomparable maximal candidates of the same kind it picks the
+ * MOST non-witness ancestors, then the FEWEST witness ancestors, then
+ * the smallest id. (rankOf/buildAncestry in the engine count the same
+ * partition over the applied set; a candidate's ancestors are all
+ * applied, so the counts agree.) */
+function tieBreakCounts(id, byId, ancCache) {
+  if (!ancCache.has(id)) {
+    const anc = ancestorIds(id, byId);
+    let intent = 0;
+    let wit = 0;
+    for (const a of anc) {
+      if (rankOf(byId.get(a)) < WITNESS_RANK) intent++;
+      else wit++;
+    }
+    ancCache.set(id, { anc, intent, wit });
+  }
+  return ancCache.get(id);
+}
+
 /** Human explanation of one conflict, from the records themselves.
- * Ported verbatim in shape from gitpp-action's fold.mjs. */
+ * Shape ported from gitpp-action's fold.mjs; the why-strings state the
+ * engine's actual rules (kind priority, ancestry supersession, and the
+ * tie-break with both candidates' measured values). */
 function explainConflict(conflict, byId) {
   const winner = byId.get(conflict.winner);
-  const wClass = kindOf(winner);
+  const wKind = kindOf(winner);
+  const ancCache = new Map();
+  const winnerInfo = tieBreakCounts(conflict.winner, byId, ancCache);
+  const wRank = rankOf(winner);
+  const pool = [conflict.winner, ...conflict.losers].filter(
+    (id) => rankOf(byId.get(id)) === wRank,
+  );
   const lines = [];
   lines.push(
     `- **${conflict.key}** = ${fmtValue(winner?.effects?.[conflict.key])} ` +
-      `— winner \`${conflict.winner}\` (${wClass}` +
+      `— winner \`${conflict.winner}\` (${wKind}` +
       (winner?.reason ? `, reason: "${winner.reason}"` : "") +
       `, parents: [${(winner?.parents ?? []).join(", ")}])`,
   );
   for (const loserId of conflict.losers) {
     const loser = byId.get(loserId);
-    const lClass = kindOf(loser);
+    const lKind = kindOf(loser);
     let why;
-    if ((REPORT_CLASS_RANK[wClass] ?? 2) < (REPORT_CLASS_RANK[lClass] ?? 2)) {
-      why = `outranked — ${wClass} beats ${lClass} (class priority is absolute)`;
-    } else if ((winner?.parents ?? []).includes(loserId)) {
+    if (rankOf(loser) > wRank) {
+      why = `outranked — ${wKind} beats ${lKind} (kind priority is absolute)`;
+    } else if (winnerInfo.anc.has(loserId)) {
       why = "superseded — the winner descends from it";
     } else {
-      why =
-        "lost the tie-break among incomparable candidates of the same " +
-        "class (cleanest ancestry chain, then smallest id)";
+      const dominators = pool
+        .filter(
+          (id) =>
+            id !== loserId &&
+            tieBreakCounts(id, byId, ancCache).anc.has(loserId),
+        )
+        .sort(cmpCodePoints);
+      if (dominators.length > 0) {
+        why =
+          `superseded — its descendant \`${dominators[0]}\` also sets ` +
+          "this key, and a descendant's claim displaces its ancestor's";
+      } else {
+        const li = tieBreakCounts(loserId, byId, ancCache);
+        why =
+          "lost the tie-break among incomparable candidates of the same kind " +
+          `(most non-witness ancestors: ${li.intent} vs winner's ${winnerInfo.intent}; ` +
+          `then fewest witness ancestors: ${li.wit} vs winner's ${winnerInfo.wit}; ` +
+          "then smallest id)";
+      }
     }
     lines.push(
-      `  - loser \`${loserId}\` (${lClass}) set ${fmtValue(loser?.effects?.[conflict.key])} — ${why}; preserved in the record`,
+      `  - loser \`${loserId}\` (${lKind}) set ${fmtValue(loser?.effects?.[conflict.key])} — ${why}; preserved in the record`,
     );
   }
   return lines;
 }
 
-function renderReport(records, project) {
+const ADVISORY =
+  "> Advisory — a mechanical derivation under the fold's rules, not an " +
+  "approval. A winner means precedence, not correctness or " +
+  "authorisation. This Check never gates a merge.";
+
+/** GitHub caps check-run output text at 65,535 chars; assemble to stay
+ * under 65,000, truncating the State list first, then Conflicts, then
+ * the rejected-input list, then Orphans — each cut marked in place.
+ * The qualifications blockquote is always the final text. */
+const MAX_TEXT = 65000;
+const TRUNC_MARKER = (n) =>
+  `… ${n} more entries truncated in this view; the derivation itself is complete`;
+
+function renderReport(records, project, opts = {}) {
   const out = derive(records);
+  const rejects = opts.rejects ?? [];
   const byId = new Map(records.map((r) => [String(r.id), r]));
-  const title = project ? `git.pp state — ${project}` : "git.pp state";
-  const lines = [];
-  lines.push(`# ${title}`);
-  lines.push("");
-  lines.push(
+  const TITLE_PREFIX = "git.pp state — ";
+  let title = project ? TITLE_PREFIX + project : "git.pp state";
+  if (title.length > 255) {
+    title = TITLE_PREFIX + String(project).slice(0, 255 - TITLE_PREFIX.length);
+  }
+  const counts =
     `${records.length} records · ${Object.keys(out.state).length} keys · ` +
-      `${out.conflicts.length} conflict(s) · ${out.orphans.length} orphan(s)`,
+    `${out.conflicts.length} conflict(s) · ${out.orphans.length} orphan(s)`;
+  const scope = opts.sha ? `Commit \`${opts.sha.slice(0, 7)}\` · ${counts}` : counts;
+  const head = [`# ${title}`, "", ADVISORY, "", scope];
+  const rejectFileCount = new Set(rejects.map((r) => r.file)).size;
+  const rejectLines = rejects.map(
+    (r) =>
+      `- \`${r.file}\`${r.index !== undefined ? ` (element ${r.index})` : ""} — ${r.error}`,
   );
-  lines.push("");
-  lines.push("## State");
-  lines.push("");
-  for (const key of Object.keys(out.state).sort()) {
-    lines.push(`- \`${key}\` = ${fmtValue(out.state[key])}`);
+  const stateLines = Object.keys(out.state)
+    .sort()
+    .map((key) => `- \`${key}\` = ${fmtValue(out.state[key])}`);
+  const conflictBlocks = out.conflicts.map((c) => explainConflict(c, byId));
+  const orphanLines = out.orphans.map((o) => `- \`${o}\``);
+
+  let dropRejects = 0;
+  let dropState = 0;
+  let dropConflicts = 0;
+  let dropOrphans = 0;
+  const build = () => {
+    const lines = [...head];
+    if (rejectLines.length > 0) {
+      lines.push(
+        "",
+        `## Rejected input — ${rejectFileCount} file(s) did not contribute`,
+        "",
+        ...rejectLines.slice(0, rejectLines.length - dropRejects),
+      );
+      if (dropRejects > 0) lines.push(TRUNC_MARKER(dropRejects));
+    }
+    lines.push("", "## State", "");
+    lines.push(...stateLines.slice(0, stateLines.length - dropState));
+    if (dropState > 0) lines.push(TRUNC_MARKER(dropState));
+    const keptBlocks = conflictBlocks.slice(
+      0,
+      conflictBlocks.length - dropConflicts,
+    );
+    if (conflictBlocks.length > 0) {
+      lines.push("", "## Conflicts (losers preserved)", "");
+      for (const b of keptBlocks) lines.push(...b);
+      if (dropConflicts > 0) lines.push(TRUNC_MARKER(dropConflicts));
+    }
+    const keptOrphans = orphanLines.slice(0, orphanLines.length - dropOrphans);
+    if (orphanLines.length > 0) {
+      lines.push("", "## Orphans (excluded from state)", "", keptOrphans.join("\n"));
+      if (dropOrphans > 0) lines.push(TRUNC_MARKER(dropOrphans));
+    }
+    lines.push("", `> ${QUALIFICATIONS}`);
+    return lines.join("\n") + "\n";
+  };
+  let text = build();
+  while (text.length > MAX_TEXT && dropState < stateLines.length) {
+    dropState++;
+    text = build();
   }
-  if (out.conflicts.length > 0) {
-    lines.push("");
-    lines.push("## Conflicts (losers preserved)");
-    lines.push("");
-    for (const c of out.conflicts) lines.push(...explainConflict(c, byId));
+  while (text.length > MAX_TEXT && dropConflicts < conflictBlocks.length) {
+    dropConflicts++;
+    text = build();
   }
-  if (out.orphans.length > 0) {
-    lines.push("");
-    lines.push("## Orphans (excluded from state)");
-    lines.push("");
-    lines.push(out.orphans.map((o) => `- \`${o}\``).join("\n"));
+  while (text.length > MAX_TEXT && dropRejects < rejectLines.length) {
+    dropRejects++;
+    text = build();
   }
-  lines.push("");
-  lines.push(`> ${QUALIFICATIONS}`);
-  return { text: lines.join("\n") + "\n", out, title };
+  while (text.length > MAX_TEXT && dropOrphans < orphanLines.length) {
+    dropOrphans++;
+    text = build();
+  }
+  return { text, out, title, summary: scope };
+}
+
+/** The failure report: used when the records surface exists but could
+ * not be read at all (every file rejected), and for defensive catches
+ * of other derivation errors. Names every rejected file and says how
+ * records must look. */
+function renderFailureText({ rejects = [], error = null, sha = "" } = {}) {
+  const title = "git.pp state — could not derive";
+  const rejectLines = rejects.map(
+    (r) =>
+      `- \`${r.file}\`${r.index !== undefined ? ` (element ${r.index})` : ""} — ${r.error}`,
+  );
+  let drop = 0;
+  const build = () => {
+    const lines = [`# ${title}`, "", ADVISORY, ""];
+    if (sha) lines.push(`Commit \`${sha.slice(0, 7)}\` · could not derive`, "");
+    lines.push("## What went wrong", "");
+    if (error) lines.push(`- Derivation failed: ${String(error).slice(0, 300)}`);
+    lines.push(...rejectLines.slice(0, rejectLines.length - drop));
+    if (drop > 0) lines.push(TRUNC_MARKER(drop));
+    lines.push(
+      "",
+      "Records are JSON files under `.gitpp/records/` — each file a plain " +
+        "object (or an array of them) with a non-empty string `id`, and " +
+        "optionally `parents` (an array of record ids), `kind` (a string), " +
+        "and `effects` (an object of key → value). See the record " +
+        "description in the gitpp-app README: " +
+        "https://github.com/patchwork-quilt/gitpp-app#the-model",
+      "",
+      `> ${QUALIFICATIONS}`,
+    );
+    return lines.join("\n") + "\n";
+  };
+  let text = build();
+  while (text.length > MAX_TEXT && drop < rejectLines.length) {
+    drop++;
+    text = build();
+  }
+  const rejectFileCount = new Set(rejects.map((r) => r.file)).size;
+  const summary =
+    rejects.length > 0
+      ? `could not derive — ${rejectFileCount} rejected file(s)`
+      : "could not derive — derivation error";
+  return { title, text, summary };
 }
 
 // ---- App JWT (RS256) -------------------------------------------------------
@@ -1486,7 +1695,15 @@ async function appJwt(app) {
   return `${header}.${payload}.${b64url(new Uint8Array(sig))}`;
 }
 
+// Installation tokens live an hour; a derivation burst (push +
+// check_suite + retries) should not mint one per event. Module-scope
+// cache keyed by installation id, reused while >60s of life remains.
+const tokenCache = new Map();
+
 async function installationToken(app, installationId) {
+  const cacheKey = String(installationId);
+  const cached = tokenCache.get(cacheKey);
+  if (cached && cached.expiresAtMs - Date.now() > 60000) return cached.token;
   const jwt = await appJwt(app);
   const res = await fetch(
     `https://api.github.com/app/installations/${installationId}/access_tokens`,
@@ -1503,6 +1720,9 @@ async function installationToken(app, installationId) {
   if (!res.ok) throw new Error(`access_tokens HTTP ${res.status}`);
   const body = await res.json();
   if (!body.token) throw new Error("access_tokens response had no token");
+  const expiresAtMs =
+    Date.parse(body.expires_at ?? "") || Date.now() + 50 * 60000;
+  tokenCache.set(cacheKey, { token: body.token, expiresAtMs });
   return body.token;
 }
 
@@ -1516,16 +1736,26 @@ function tarField(bytes, off, len) {
   return new TextDecoder().decode(bytes.subarray(off, end));
 }
 
-/** Parse a ustar archive into [{name, text}] for regular files. Handles
- * the 155-byte prefix field, GNU longname ('L') and pax ('x') path
- * overrides — GitHub/codeload tarballs use all three. */
+/** Parse a ustar archive into [{name, text}] for regular files UNDER
+ * .gitpp/ only — bodies of other entries are never decoded (the walk
+ * advances offsets only), so a huge repo tree costs no decode time.
+ * Handles the 155-byte prefix field, GNU longname ('L') and pax ('x')
+ * path overrides — GitHub/codeload tarballs use all three. A base-256
+ * (binary) size field is refused with a clear error instead of being
+ * misread as octal, which would desync the whole walk. */
 function parseTar(bytes) {
   const entries = [];
   let offset = 0;
   let pendingName = null;
+  const wanted = (name) => /(^|\/)\.gitpp\//.test(name);
   while (offset + 512 <= bytes.length) {
     const name = tarField(bytes, offset, 100);
     if (!name) break;
+    if (bytes[offset + 124] & 0x80) {
+      throw new Error(
+        "unsupported base-256 tar size field (binary size encoding)",
+      );
+    }
     const sizeText = tarField(bytes, offset + 124, 12).trim();
     const size = sizeText ? parseInt(sizeText, 8) || 0 : 0;
     const type = String.fromCharCode(bytes[offset + 156] || 48);
@@ -1556,7 +1786,10 @@ function parseTar(bytes) {
     } else if (type === "L") {
       pendingName = new TextDecoder().decode(data).replace(/\0+$/, "");
     } else if (type === "0" || type === "\0" || type === "") {
-      entries.push({ name: fullName, text: new TextDecoder().decode(data) });
+      if (wanted(fullName)) {
+        entries.push({ name: fullName, text: new TextDecoder().decode(data) });
+      }
+      // Not under .gitpp/: skip the body entirely (offset walk only).
     }
     offset = dataStart + Math.ceil(size / 512) * 512;
   }
@@ -1573,6 +1806,89 @@ async function gunzip(bytes) {
 const RECORD_PATH = /(^|\/)\.gitpp\/records\/[^/]+\.json$/;
 const PROJECT_PATH = /(^|\/)\.gitpp\/project\.json$/;
 
+// ---- Input gate ------------------------------------------------------------
+//
+// Every record file is gated individually. A file that cannot be read —
+// or a record that cannot be trusted — becomes a REJECT naming its file
+// (and element index, for array files) and the specific reason; rejects
+// never throw, never vanish silently, and never block the surviving
+// records from deriving. The gate exists because the fold indexes
+// records by id into plain objects: an id of "__proto__" or an effects
+// key of "__proto__" would otherwise corrupt or silently drop data,
+// and one file's JSON error used to abort the whole derivation.
+
+class TooLargeError extends Error {
+  constructor(which) {
+    super(`too-large: ${which}`);
+    this.tooLarge = true;
+    this.which = which;
+  }
+}
+
+const MAX_GZ_BYTES = 25 * 1024 * 1024;
+const MAX_TAR_BYTES = 100 * 1024 * 1024;
+const MAX_RECORD_FILES = 5000;
+const MAX_RECORDS = 20000;
+
+function isPlainObject(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function truncErr(msg) {
+  const s = String(msg ?? "unknown error");
+  return s.length > 120 ? s.slice(0, 120) + "…" : s;
+}
+
+function gateRecord(candidate, file, index) {
+  const reject = (error) => ({
+    reject: {
+      file,
+      ...(index !== undefined ? { index } : {}),
+      error: truncErr(error),
+    },
+  });
+  if (!isPlainObject(candidate)) {
+    return reject(
+      index !== undefined
+        ? "array element is not a plain object"
+        : "top-level JSON is not a record object or an array of records",
+    );
+  }
+  if (typeof candidate.id !== "string" || candidate.id.length === 0) {
+    return reject("record id is missing or not a non-empty string");
+  }
+  if (candidate.id === "__proto__") {
+    return reject('record id "__proto__" is not allowed');
+  }
+  if (candidate.parents !== undefined) {
+    if (
+      !Array.isArray(candidate.parents) ||
+      !candidate.parents.every((p) => typeof p === "string")
+    ) {
+      return reject("parents is present but is not an array of strings");
+    }
+  }
+  if (candidate.effects !== undefined) {
+    if (!isPlainObject(candidate.effects)) {
+      return reject("effects is present but is not a plain object");
+    }
+    if (Object.prototype.hasOwnProperty.call(candidate.effects, "__proto__")) {
+      return reject('effects contains a "__proto__" key, which is not allowed');
+    }
+  }
+  if (candidate.kind !== undefined && typeof candidate.kind !== "string") {
+    return reject("kind is present but is not a string");
+  }
+  return { record: candidate };
+}
+
+/** Repo-relative display path for a tar entry (strip the tarball's
+ * top-level "<repo>-<sha>/" segment). */
+function displayPath(name) {
+  const i = name.indexOf("/");
+  return i >= 0 ? name.slice(i + 1) : name;
+}
+
 async function fetchRecords(token, repo, sha) {
   const res = await fetch(
     `https://api.github.com/repos/${repo}/tarball/${sha}`,
@@ -1588,39 +1904,153 @@ async function fetchRecords(token, repo, sha) {
   );
   if (!res.ok) throw new Error(`tarball HTTP ${res.status}`);
   const gz = new Uint8Array(await res.arrayBuffer());
-  const entries = parseTar(await gunzip(gz));
+  if (gz.byteLength > MAX_GZ_BYTES) {
+    throw new TooLargeError(
+      `compressed tarball is ${gz.byteLength} bytes (limit ${MAX_GZ_BYTES})`,
+    );
+  }
+  const tar = await gunzip(gz);
+  if (tar.byteLength > MAX_TAR_BYTES) {
+    throw new TooLargeError(
+      `decompressed tar is ${tar.byteLength} bytes (limit ${MAX_TAR_BYTES})`,
+    );
+  }
+  const entries = parseTar(tar);
   const records = [];
+  const rejects = [];
   let project = null;
+  let recordFileCount = 0;
   for (const e of entries) {
     if (RECORD_PATH.test(e.name)) {
-      const parsed = JSON.parse(e.text);
-      if (Array.isArray(parsed)) records.push(...parsed);
-      else records.push(parsed);
+      recordFileCount++;
+      if (recordFileCount > MAX_RECORD_FILES) {
+        throw new TooLargeError(`more than ${MAX_RECORD_FILES} record files`);
+      }
+      const file = displayPath(e.name);
+      let text = e.text;
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        rejects.push({
+          file,
+          error: truncErr(`JSON parse failed: ${err.message}`),
+        });
+        continue;
+      }
+      const items = Array.isArray(parsed)
+        ? parsed.map((v, i) => [v, i])
+        : [[parsed, undefined]];
+      for (const [item, index] of items) {
+        const gated = gateRecord(item, file, index);
+        if (gated.reject) {
+          rejects.push(gated.reject);
+        } else {
+          records.push(gated.record);
+          if (records.length > MAX_RECORDS) {
+            throw new TooLargeError(`more than ${MAX_RECORDS} parsed records`);
+          }
+        }
+      }
     } else if (PROJECT_PATH.test(e.name)) {
       try {
-        project = JSON.parse(e.text);
+        let text = e.text;
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        project = JSON.parse(text);
       } catch {
         project = null;
       }
     }
   }
-  return { records, project };
+  return { records, rejects, project, recordFileCount };
 }
 
 // ---- The loop ---------------------------------------------------------------
 
+function rand6() {
+  const b = new Uint8Array(3);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** Append one event-log entry as its OWN KV key
+ * ("evt:<ISO timestamp>:<rand6>"). The old ring was a single
+ * read-modify-write array: two simultaneous deliveries could read the
+ * same array and the later write silently dropped the earlier entry.
+ * Per-entry keys make appends independent; /events lists and merges.
+ * Never throws — the log is a courtesy surface, not a gate. */
 async function appendRing(env, entry) {
-  let ring = [];
   try {
-    const raw = await env.CREDS.get("events");
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) ring = parsed;
-  } catch {
-    ring = [];
+    const key = `evt:${entry.t}:${rand6()}`;
+    await env.CREDS.put(key, JSON.stringify(entry));
+  } catch {}
+}
+
+/** The id of an existing "git.pp state" check run on this commit, or
+ * null. This is the idempotence backstop: KV claims can race, but a
+ * run GitHub already holds cannot be un-held — if one exists, never
+ * post a second. */
+async function existingCheckId(token, repo, sha) {
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent("git.pp state")}`,
+    {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": "gitpp-app-receiver",
+      },
+    },
+  );
+  if (!res.ok) return null;
+  const body = await res.json();
+  if (body.total_count > 0 && body.check_runs?.[0]?.id) {
+    return body.check_runs[0].id;
   }
-  ring.push(entry);
-  ring = ring.slice(-20);
-  await env.CREDS.put("events", JSON.stringify(ring));
+  return null;
+}
+
+async function postCheckRun(token, repo, sha, { title, summary, text, conclusion }) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/check-runs`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "content-type": "application/json",
+      "user-agent": "gitpp-app-receiver",
+    },
+    body: JSON.stringify({
+      name: "git.pp state",
+      head_sha: sha,
+      status: "completed",
+      conclusion,
+      output: { title, summary, text },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `check-runs HTTP ${res.status}: ${(await res.text()).slice(0, 80)}`,
+    );
+  }
+  const created = await res.json();
+  return created.id;
+}
+
+/** Post the failure Check (conclusion "failure" — the one case this app
+ * uses it: input it could not read at all, or a derivation error).
+ * Honours the same GitHub-side idempotence as the neutral path. */
+async function postFailureCheck(token, repo, sha, failure) {
+  const existing = await existingCheckId(token, repo, sha).catch(() => null);
+  if (existing) return existing;
+  const { title, summary, text } = renderFailureText({ ...failure, sha });
+  return postCheckRun(token, repo, sha, {
+    title,
+    summary,
+    text,
+    conclusion: "failure",
+  });
 }
 
 async function deriveAndPost(env, app, { repo, sha, installationId }) {
@@ -1633,59 +2063,109 @@ async function deriveAndPost(env, app, { repo, sha, installationId }) {
       action,
       ...(detail ? { detail: String(detail).slice(0, 120) } : {}),
     }).catch(() => {});
-  const dedupeKey = `derived:${repo}:${sha}`;
+  const inflightKey = `inflight:${repo}:${sha}`;
+  const postedKey = `posted:${repo}:${sha}`;
+  let claimed = false;
+  let token = null;
+  let stage = "claim";
+  const releaseClaim = async () => {
+    if (!claimed) return;
+    claimed = false;
+    try {
+      await env.CREDS.delete(inflightKey);
+    } catch {}
+  };
   try {
-    if (await env.CREDS.get(dedupeKey)) {
-      await log("skipped-duplicate");
+    if (await env.CREDS.get(postedKey)) {
+      await log("skipped-duplicate", "posted marker exists for this commit");
+      return;
+    }
+    if (await env.CREDS.get(inflightKey)) {
+      await log("skipped-duplicate", "inflight claim held for this commit");
       return;
     }
     // Claim the commit before working: push and check_suite for the same
     // sha arrive as separate deliveries, and the second must find this.
-    await env.CREDS.put(dedupeKey, "inflight", { expirationTtl: 86400 });
+    await env.CREDS.put(inflightKey, "1", { expirationTtl: 600 });
+    claimed = true;
     const instId = installationId ?? app.installation_id;
     if (!instId) throw new Error("no installation id in payload or store");
-    const token = await installationToken(app, instId);
-    const { records, project } = await fetchRecords(token, repo, sha);
-    if (records.length === 0) {
+    stage = "token";
+    token = await installationToken(app, instId);
+    stage = "fetch";
+    const { records, rejects, project, recordFileCount } =
+      await fetchRecords(token, repo, sha);
+    if (records.length === 0 && rejects.length === 0) {
+      // No records surface (or only empty ones): silence, by design.
+      await releaseClaim();
       await log("skipped-no-records");
       return;
     }
+    if (records.length === 0 && recordFileCount > 0) {
+      // A records surface exists but nothing in it could be read:
+      // never silent — a failure Check naming every rejected file.
+      const fid = await postFailureCheck(token, repo, sha, { rejects });
+      await env.CREDS.put(postedKey, `failed:${fid}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log(
+        "posted",
+        `failure check ${fid} — ${rejects.length} rejected input(s)`,
+      );
+      return;
+    }
+    stage = "render";
     const projectName =
       (typeof project?.project === "string" && project.project) || repo;
-    const { text, title } = renderReport(records, projectName);
-    const summary =
-      text.split("\n").find((l) => l.includes("records ·")) ?? title;
-    const res = await fetch(`https://api.github.com/repos/${repo}/check-runs`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: "application/vnd.github+json",
-        "x-github-api-version": "2022-11-28",
-        "content-type": "application/json",
-        "user-agent": "gitpp-app-receiver",
-      },
-      body: JSON.stringify({
-        name: "git.pp state",
-        head_sha: sha,
-        status: "completed",
-        conclusion: "neutral",
-        output: { title, summary, text: text.slice(0, 65535) },
-      }),
+    const { text, title, summary } = renderReport(records, projectName, {
+      sha,
+      rejects,
     });
-    if (!res.ok) {
-      throw new Error(`check-runs HTTP ${res.status}: ${(await res.text()).slice(0, 80)}`);
+    stage = "post";
+    const existing = await existingCheckId(token, repo, sha).catch(() => null);
+    if (existing) {
+      await env.CREDS.put(postedKey, `posted:${existing}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log("skipped-duplicate", `check ${existing} already exists`);
+      return;
     }
-    const created = await res.json();
-    await env.CREDS.put(dedupeKey, `posted:${created.id}`, {
+    const checkId = await postCheckRun(token, repo, sha, {
+      title,
+      summary,
+      text,
+      conclusion: "neutral",
+    });
+    await env.CREDS.put(postedKey, `posted:${checkId}`, {
       expirationTtl: 86400,
     });
-    await log("posted", `check ${created.id}`);
+    await releaseClaim();
+    await log(
+      "posted",
+      `check ${checkId}` +
+        (rejects.length > 0 ? ` · ${rejects.length} rejected input(s)` : ""),
+    );
   } catch (err) {
-    // Release the claim so a rerequested suite can retry, then record.
-    try {
-      const cur = await env.CREDS.get(dedupeKey);
-      if (cur === "inflight") await env.CREDS.delete(dedupeKey);
-    } catch {}
+    await releaseClaim();
+    // Never silent: while we hold a token and the failure is not the
+    // Check POST itself, surface the error as a failure Check on the
+    // commit (a reader of the repo should not have to find this
+    // Worker's event log to learn derivation died). If that surfacing
+    // also fails, the ring entry below is the record.
+    if (token && stage !== "post") {
+      try {
+        const fid = await postFailureCheck(token, repo, sha, {
+          error: err?.message ?? String(err),
+        });
+        await env.CREDS.put(postedKey, `failed:${fid}`, {
+          expirationTtl: 86400,
+        });
+        await log("failed", `${err?.message ?? err} (failure check ${fid})`);
+        return;
+      } catch {}
+    }
     await log("failed", err?.message ?? err);
   }
 }
