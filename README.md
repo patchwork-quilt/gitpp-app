@@ -2,7 +2,7 @@
 
 **gitpp-app watches a repository's provenance-carrying git.pp records,
 derives the one deterministic state from them, and posts that state as
-a Check on the pull request — the winning value, the preserved losers,
+a Check on the pushed commit — the winning value, the preserved losers,
 and the ancestry that decided.**
 
 For teams running several coding agents — or agents plus humans —
@@ -61,13 +61,25 @@ verified deliveries, newest last.
   installation token from the stored key, fetches the pushed
   commit's tarball (one API call), extracts `.gitpp/records/`,
   folds them with the vendored engine, and posts the derived state
-  as an advisory (always `neutral`) check run named `git.pp state`
-  on the commit — state, winners, losers with reasons, and the
-  qualifications line. A push and its check-suite for the same
-  commit coalesce to one Check. Repositories with no
-  `.gitpp/records` get silence. Proven live on the demo repository:
-  push → Check showing `config.timeout = 45`, winner `override-1`,
-  losers `task-a`/`task-b`/`task-d` preserved.
+  as an advisory check run named `git.pp state` on the commit —
+  state, winners, losers with reasons, and the **qualifications
+  line**, the Check's closing blockquote: *"Mechanical resolution
+  of labelled key conflicts only; the fold does not settle semantic
+  conflicts. Digests authenticate content, not authorship. Arrival
+  order is never an input."* The conclusion is `neutral`, with one
+  exception: input the App cannot read is never silent — a file
+  that fails to parse or fails validation is rejected by name in
+  the Check while the surviving records still derive, and a
+  records surface it cannot read at all earns a `failure` Check
+  titled "could not derive", naming every rejected file. A push
+  and its check-suite for the same commit coalesce to one Check. A
+  push that changes no records still re-derives and posts a fresh
+  Check on the new commit — derivation is per commit, not per
+  record-change. Repositories with no `.gitpp/records` get no
+  Check, though their deliveries still appear in `/events`. Proven
+  live on the demo repository: push → Check showing
+  `config.timeout = 45`, winner `override-1`, losers
+  `task-a`/`task-b`/`task-d` preserved.
 - The App's credentials, held in the Worker's `CREDS` KV store —
   never in this repo, never rendered in a page or a log.
 
@@ -148,7 +160,8 @@ Failure behaviour, stated:
 
 `manifest.json` in this repo is byte-identical to the manifest the
 App was registered with (`deploy/deploy.py` refuses to deploy if
-the copy embedded in `worker.js` drifts from it). Read tier only:
+the copy embedded in `worker.js` drifts from it). Two read grants,
+and the one write the Check requires:
 
 | Permission | Level | Why |
 |---|---|---|
@@ -164,7 +177,8 @@ deliberate.** `pull_request` is absent because GitHub's manifest
 validation rejected it: those events require the `pull_requests`
 permission, which this App does not request (the ancestry rides in
 the Check output instead). `installation` and
-`installation_repositories` are absent because GitHub delivers
+`installation_repositories` (the misspelling is GitHub's own, from
+its validation error) are absent because GitHub delivers
 installation events to every App by default and refuses them as
 manifest declarations. Receipt: the 2026-10-21 rejection and
 correction are in this repo's git history (`07fc1a3`), and the
@@ -175,11 +189,14 @@ registered manifest above is what survived validation.
 - Derivation is per-commit and whole-snapshot: each push fetches
   the full tarball and folds from scratch. Correct first, fast
   later — the incremental path is designed, not built.
-- Coalescing rests on a per-commit claim key in the credential
-  store (24 h TTL): a push and its check-suite for the same commit
-  produce one Check. The public event ring is a read-modify-write
-  list, so under simultaneous deliveries an entry can be lost; the
-  Check count is the invariant, the ring is a courtesy log.
+- Coalescing is per commit, in two layers: an in-flight claim
+  (10 min TTL) and a posted marker (24 h TTL) in the credential
+  store, plus — before anything posts — a check against GitHub
+  itself for an existing `git.pp state` run on that commit. A push
+  and its check-suite for the same commit produce one Check. The
+  public event ring now stores one key per entry, so simultaneous
+  deliveries no longer overwrite each other; the ring remains a
+  courtesy log, and the Check count is the invariant.
 - The fold resolves labelled key conflicts mechanically. It does
   **not** settle semantic conflicts, and a gitpp Check must never be
   read as claiming it did.
@@ -210,17 +227,20 @@ An installation token's primary limit — 5,000 requests/hour — is a
 GHEC). The constraint that binds this App's design is the secondary
 limit: **80 content-generating requests per minute, 500 per hour**.
 Posting a Check is content-generating. So derivation must coalesce
-per commit instead of firing per event: a burst of pushes to one
-branch is one fold and one Check update, not one per webhook. This
-is a design requirement, not an optimisation, and it is stated
-before the derivation step is built so the build inherits it.
+per commit instead of firing per event: coalescing is per commit,
+so the push and the check-suite for one commit produce one fold and
+one Check — and each new commit gets its own. This is a design
+requirement, not an optimisation; it was stated before the
+derivation step was built, and the build inherited it.
 (BUDGET.md §1, with the correction recorded there.)
 
 The same document does the collection arithmetic. Reading records
 file-by-file over REST costs N+2 API calls per derivation; at the
-demo scale of 62 records and a modelled 900 derivations/day, that
-is ≈ 5,940 calls/hour — over the primary floor before any other
-API use. Clone-class collection (one fetch operation plus bytes —
+demo scale of 62 records (62 is the poc-scale-1 record set; the
+dogfood repository below carries 8) and a modelled 900
+derivations/day, that is ≈ 5,940 calls/hour — over the primary floor
+before any other API use. Clone-class collection (one fetch
+operation plus bytes —
 a tarball on Workers, which has no git binary) lands at ≈ 180 REST
 calls/hour, about 4% of the budget, with the real cost moved to
 bandwidth and fold CPU, which are ours to provision. That is why
@@ -236,8 +256,7 @@ everything expensive lives behind the acknowledgment. What the
 receiver does inside the window is deliberately small: verify the
 signature, record five fields, answer 202. `worker.js` is one file
 and the intake path is most of it — the smallness is the design,
-and the derivation step is being built to run behind the ack, never
-inside it.
+and the derivation step runs behind the ack, never inside it.
 
 ### The binding that vanished
 
@@ -269,7 +288,7 @@ not the upload response.
   if the manifest embedded in `worker.js` differs from
   `manifest.json`, and prints the comparison before uploading.
 - Fold claims trace sideways, not to this README: the engine the
-  derivation step will call is specified in `git.pp-ng`, and its
+  derivation step calls is specified in `git.pp-ng`, and its
   measured ledger is that repo's RESULTS.md (three independent
   ports passing one conformance corpus byte-identically). Anything
   here that reads as a claim about the fold should be checked
@@ -343,9 +362,10 @@ One tool, one repo — take the one whose shape fits:
   the fold does and does not claim.
 - **[gitpp-demo-quilt](https://github.com/patchwork-quilt/gitpp-demo-quilt)**
   — the dogfood repository this App is installed on: the
-  poc-quilt-1 record set hosted on GitHub under `.gitpp/records`,
-  whose derived state is `config.timeout = 45`, winner
-  `override-1`, losers preserved.
+  poc-quilt-1 record set (poc-quilt-1 is the dogfood project —
+  the programme's original eight-record proof-of-concept set)
+  hosted on GitHub under `.gitpp/records`, whose derived state is
+  `config.timeout = 45`, winner `override-1`, losers preserved.
 
 ## Licence
 
