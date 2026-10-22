@@ -93,26 +93,29 @@ ${body}
 function landingPage() {
   const manifestJson = JSON.stringify(MANIFEST, null, 2);
   return page(
-    "gitpp-app — not yet registered",
+    "gitpp-app — the git.pp GitHub App",
     `<h1>gitpp-app</h1>
-<p><strong>Status: the GitHub App does not exist yet.</strong> This page is
-its future home and its registration desk. The receiver behind it is live
-but dark: it cannot accept webhooks until the App below is created and its
-credentials land in this Worker's store automatically.</p>
-<p>gitpp-app will bring git.pp to GitHub: when agents and humans complete
+<p><strong>Status: live.</strong> The GitHub App exists —
+<a href="https://github.com/apps/gitpp-app">github.com/apps/gitpp-app</a>
+(app 5419092, owned by patchwork-quilt) — and is installed on
+patchwork-quilt/gitpp-demo-quilt. The receiver behind this page verifies
+and records its webhook deliveries (<a href="/events">recent events</a>;
+<a href="/health">health</a>). What it does not do yet: derive state and
+post the Check — that is the next build, stated plainly.</p>
+<p>gitpp-app brings git.pp to GitHub: when agents and humans complete
 work concurrently against the same shared state — configuration keys, task
 claims, release freezes — it derives one deterministic state from their
 provenance-carrying records and posts it as a Check on the pull request:
 the winning value, the preserved losers, and the ancestry that decided.
 It resolves labelled key conflicts mechanically; it does not settle
 semantic conflicts.</p>
-<h2>What the button creates</h2>
-<p>Clicking the button below sends the manifest shown here — exactly this
-JSON, nothing hidden — to GitHub's App Manifest flow <strong>on the
-patchwork-quilt organisation's page</strong>, so the app will be owned by
-the patchwork-quilt org, not by a personal account. GitHub will ask you to
-confirm creating an app with this name, these permissions, and these
-events:</p>
+<h2>The manifest this instance was created from</h2>
+<p>Shown in full — exactly this JSON, nothing hidden. It was sent to
+GitHub's App Manifest flow on the patchwork-quilt organisation's page, so
+the app is owned by the org, not by a personal account. The button below
+sends the same manifest again — that is how you register <em>your own</em>
+instance (a fork gets its own app, its own credentials, its own store);
+it does not change this instance.</p>
 <pre>${esc(manifestJson)}</pre>
 <table>
 <tr><th>Permission</th><th>Level</th><th>Why</th></tr>
@@ -129,7 +132,7 @@ app deliberately does not request — learned from GitHub's own
 manifest validation, 2026-10-21).</p>
 <form action="https://github.com/organizations/patchwork-quilt/settings/apps/new" method="post">
 <input type="hidden" name="manifest" value="${esc(JSON.stringify(MANIFEST))}">
-<p><button type="submit">Create the gitpp-app GitHub App</button></p>
+<p><button type="submit">Register your own instance with this manifest</button></p>
 </form>
 <p>After GitHub confirms, it redirects back here with a one-time code;
 this site exchanges it and stores the new App's credentials directly in
