@@ -12,9 +12,10 @@ silently losing the losing work. Not for code-level merge conflicts:
 the fold resolves *labelled key* conflicts mechanically, and this
 document says plainly where that boundary sits.
 
-Today, the receiver half of that sentence is live and the derivation
-half is the next build. The status section below says exactly which
-is which, before you depend on either.
+Today both halves of that sentence are live: the receiver verifies
+and records deliveries, and the derivation step fetches the records,
+folds them, and posts the answer as a Check on the commit. The status
+section below says exactly what is proven, before you depend on it.
 
 ## Run it now: look at the live instance
 
@@ -45,7 +46,7 @@ verified deliveries, newest last.
 
 ## Status — what exists, what does not
 
-**Exists (verified 2026-10-21):**
+**Exists (verified 2026-10-21; derivation verified 2026-10-22):**
 
 - The App itself: `gitpp-app`, App ID 5419092,
   <https://github.com/apps/gitpp-app>, owned by the patchwork-quilt
@@ -56,21 +57,33 @@ verified deliveries, newest last.
 - Signature-verified webhook intake: the receiver verifies
   `X-Hub-Signature-256` against the stored webhook secret and
   records each accepted delivery in the ring above.
+- The derivation loop: behind the 202, the Worker mints an
+  installation token from the stored key, fetches the pushed
+  commit's tarball (one API call), extracts `.gitpp/records/`,
+  folds them with the vendored engine, and posts the derived state
+  as an advisory (always `neutral`) check run named `git.pp state`
+  on the commit — state, winners, losers with reasons, and the
+  qualifications line. A push and its check-suite for the same
+  commit coalesce to one Check. Repositories with no
+  `.gitpp/records` get silence. Proven live on the demo repository:
+  push → Check showing `config.timeout = 45`, winner `override-1`,
+  losers `task-a`/`task-b`/`task-d` preserved.
 - The App's credentials, held in the Worker's `CREDS` KV store —
   never in this repo, never rendered in a page or a log.
 
 **Does not exist yet:**
 
-- **The derivation step.** On a push, the receiver verifies the
-  delivery, records it, and answers 202. It does **not** yet fetch
-  the repository's records, fold them, or post a Check. That is the
-  next build, and until it lands, installing this App gives you a
-  verified event log — not derived state on your pull requests.
+- **A delta/frontier fetch.** Every derivation reads the repository
+  tarball for the pushed commit in full (one API call) — cheap at
+  this scale, but there is no incremental path yet; the engine's
+  frontier machinery is not wired into this Worker.
+- **More than one installation.** The code is installation-driven
+  (it uses the webhook's own installation id), but so far it has
+  only ever run for the one installation named above.
 
-One cosmetic leftover: the landing page at
-<https://gitpp-app.superinstance.dev> still presents the registration
-desk, including copy written before the App existed. Read it as the
-register-your-own entry point (below), not as a status page.
+The landing page at <https://gitpp-app.superinstance.dev> now leads
+with the live status and keeps the manifest desk below it — read the
+desk as the register-your-own entry point (below).
 
 ## The model
 
@@ -94,16 +107,17 @@ Five concepts, in the order they compose:
   this App actually received carries exactly the manifest's
   permissions: checks write, contents read, metadata read (observed
   at mint time, 2026-10-21).
-- **Check** — the output surface the derivation step will write: a
-  check run on the pull request whose output carries the derived
-  state and the deciding ancestry. This is also why the ancestry
+- **Check** — the output surface the derivation step writes: a
+  check run on the pushed commit (pull requests carrying that commit
+  display it) whose output carries the derived state and the
+  deciding ancestry. This is also why the ancestry
   needs no pull-request permission: it rides in the Check's own
   output, not in comments.
 
 ```
 agent / human ──push records──▶ GitHub ──webhook (HMAC-signed)──▶ this Worker
 Worker: verify signature → record delivery → 202        ✓ live today
-        └─▶ fetch records → fold → post Check            ✗ next build
+        └─▶ fetch records → fold → post Check            ✓ live today
 ```
 
 ### Endpoints, and how each behaves
@@ -140,7 +154,7 @@ the copy embedded in `worker.js` drifts from it). Read tier only:
 |---|---|---|
 | Metadata | Read | Platform baseline: which repos exist, who installed the App. |
 | Contents | Read | To read the record files. **GitHub grants Contents repository-wide; there is no path-scoped grant.** The App touches record paths only as a matter of published policy and open source — the limit is policy, enforced by this code being public, not by the grant itself. This sentence is the honest version, and it is the version any listing will carry. |
-| Checks | Write | To post the derived state as a Check run (once the derivation step lands). |
+| Checks | Write | To post the derived state as a Check run on the pushed commit. |
 
 Nothing else: no pull-request permission, no administration, no
 repository creation, no contents write.
@@ -158,8 +172,14 @@ registered manifest above is what survived validation.
 
 ## Honest limits
 
-- No derivation yet — see Status. The Check this App will post is
-  designed, not built.
+- Derivation is per-commit and whole-snapshot: each push fetches
+  the full tarball and folds from scratch. Correct first, fast
+  later — the incremental path is designed, not built.
+- Coalescing rests on a per-commit claim key in the credential
+  store (24 h TTL): a push and its check-suite for the same commit
+  produce one Check. The public event ring is a read-modify-write
+  list, so under simultaneous deliveries an entry can be lost; the
+  Check count is the invariant, the ring is a courtesy log.
 - The fold resolves labelled key conflicts mechanically. It does
   **not** settle semantic conflicts, and a gitpp Check must never be
   read as claiming it did.
