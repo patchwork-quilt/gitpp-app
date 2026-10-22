@@ -49,9 +49,7 @@ const MANIFEST = /*MANIFEST-BEGIN*/{
   },
   "default_events": [
     "push",
-    "pull_request",
-    "installation",
-    "installation_repositories"
+    "check_suite"
   ]
 }/*MANIFEST-END*/;
 
@@ -124,8 +122,11 @@ events:</p>
 </table>
 <p>Nothing else. No pull-request permission (the ancestry rides in the
 Check's own output), no administration, no repository creation, no
-contents write. Events: push, pull_request, installation,
-installation_repositories.</p>
+contents write. Events: push and check_suite (installation events
+are delivered to every app by default and cannot be listed;
+pull_request events would require a pull-requests permission this
+app deliberately does not request — learned from GitHub's own
+manifest validation, 2026-10-21).</p>
 <form action="https://github.com/organizations/patchwork-quilt/settings/apps/new" method="post">
 <input type="hidden" name="manifest" value="${esc(JSON.stringify(MANIFEST))}">
 <p><button type="submit">Create the gitpp-app GitHub App</button></p>

@@ -1,1 +1,19 @@
-{"default_events":["push","pull_request","installation","installation_repositories"],"default_permissions":{"checks":"write","contents":"read","metadata":"read"},"description":"Deterministic, lossless resolution of labelled key conflicts in shared agent state — winner, losers, and the ancestry that decided; it does not settle semantic conflicts, and content digests authenticate content, not authorship.","hook_attributes":{"url":"https://gitpp-app.superinstance.dev/webhook"},"name":"gitpp-app","public":true,"redirect_url":"https://gitpp-app.superinstance.dev/setup/callback","url":"https://gitpp-app.superinstance.dev"}
+{
+  "default_events": [
+    "push",
+    "check_suite"
+  ],
+  "default_permissions": {
+    "checks": "write",
+    "contents": "read",
+    "metadata": "read"
+  },
+  "description": "Deterministic, lossless resolution of labelled key conflicts in shared agent state \u2014 winner, losers, and the ancestry that decided; it does not settle semantic conflicts, and content digests authenticate content, not authorship.",
+  "hook_attributes": {
+    "url": "https://gitpp-app.superinstance.dev/webhook"
+  },
+  "name": "gitpp-app",
+  "public": true,
+  "redirect_url": "https://gitpp-app.superinstance.dev/setup/callback",
+  "url": "https://gitpp-app.superinstance.dev"
+}
