@@ -20,11 +20,21 @@ of registration, so the owner's one click has somewhere real to land:
 
 - `GET /` — what the App will be, and the registration desk: the
   exact manifest the button sends to GitHub, rendered in full.
-- `GET /health` — `{"status":"dark","app":"gitpp-app","registered":false}`.
+- `GET /health` — `{"status":"dark","app":"gitpp-app","registered":false}`
+  until the App's record lands in the credential store, then
+  `{"status":"live",...,"registered":true}`.
 - `POST /webhook` — answers `503 {"error":"not configured"}` until a
-  webhook secret exists. That is the honest state, not an error.
-- No derivation yet: the receiver accepts and logs events; deriving
-  state from them is the next M1 step, after registration.
+  registered App's record exists in the Worker's credential store
+  (the `CREDS` KV namespace, where the callback puts it). That is
+  the honest state, not an error. Verified events are recorded in a
+  capped ring (last 20) in the same store: timestamp, event, repo,
+  installation, action — nothing else.
+- `GET /events` — that recorded ring, as JSON. **Public by design
+  for the dogfood phase** — it is the proof surface that events are
+  arriving. It carries no payload bodies and no sender data, and it
+  gets gated before any Marketplace step.
+- No derivation yet: the receiver accepts and records events;
+  deriving state from them is the next M1 step, after registration.
 
 ## The permission manifest, in plain words
 
@@ -60,34 +70,38 @@ the manifest code). Start it when you have ten unhurried minutes;
 it takes two.
 
 
+That is the owner's whole job:
+
 1. Open <https://gitpp-app.superinstance.dev>. Read the manifest on
    the page — it is byte-identical to `manifest.json` here; the
    deploy script refuses to deploy if they drift.
-2. Click **Create the gitpp-app GitHub App** and confirm on GitHub.
-   (Manifest-flow names are first-come; if `gitpp-app` is taken,
-   GitHub will say so at this step, and the name in both files gets
-   adjusted before retrying.)
-3. GitHub redirects back to `/setup/callback`, which exchanges the
-   one-time code and displays the new App's credentials **exactly
-   once** — App ID, slug, client ID, webhook secret, private key.
-   The receiver stores nothing and logs nothing; if the page is
-   missed, a new private key can be generated under the App's
-   GitHub settings instead.
-4. Put the credentials in the Secure Vault (private key + webhook
-   secret at minimum). Never in a repo, never in a ticket.
-5. Set the Worker's `WEBHOOK_SECRET` secret to the webhook secret
-   from step 3 — that is what lifts the receiver out of its dark
-   state (`/webhook` starts answering 202 to signature-valid events).
-6. Install the App on one repository (GitHub's install flow, per-repo
-   selection) and open a test PR. Expect one structured log line per
-   event in the Worker's logs; derivation arrives with the next M1
-   step.
+2. Click **Create the gitpp-app GitHub App**. The form submits to
+   the patchwork-quilt organisation's GitHub page, so the App will
+   be owned by the org. Confirm on GitHub, within the one-hour
+   window above. (Manifest-flow names are first-come; if `gitpp-app`
+   is taken, GitHub will say so at this step, and the name in both
+   files gets adjusted before retrying.)
+3. Done. GitHub redirects back to `/setup/callback`, which exchanges
+   the one-time code and stores the App's credentials directly in
+   the Worker's credential store (the `CREDS` KV namespace)
+   automatically. **Nothing to copy, nothing to vault by hand, and
+   no secret ever appears in a page, a chat, or a log** — the
+   confirmation page shows only that it succeeded, the App ID, its
+   GitHub URL, and the owner login. `/health` flips to
+   `registered: true` / `status: "live"`, and `/webhook` starts
+   answering 202 to signature-valid events.
+4. Install the App on one repository (GitHub's install flow,
+   per-repo selection) and open a test PR. Recorded events appear
+   at `/events`; derivation arrives with the next M1 step.
 
 ## Deploy
 
 `deploy/deploy.py` uploads `worker.js` via the fleet's OAuth route
 and asserts the embedded manifest matches `manifest.json`. The
-hostname is a Workers Custom Domain on the same script.
+deploy metadata binds the `CREDS` KV namespace (title
+`gitpp-app-creds`), which holds the stored App record under `app`
+and the event ring under `events`. The hostname is a Workers Custom
+Domain on the same script.
 
 ## Licence
 

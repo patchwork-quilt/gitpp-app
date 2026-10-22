@@ -3,9 +3,9 @@
 // DARK BY DESIGN: no GitHub App is registered yet. This Worker is the
 // receiving half, deployed ahead of registration so the owner's single
 // click (the App Manifest flow, from the landing page below) has
-// somewhere real to land. Until a webhook secret is configured, the
-// webhook endpoint answers 503 "not configured" — that is the honest
-// state, not an error.
+// somewhere real to land. Until the conversion callback stores the new
+// App's record in the CREDS KV namespace, the webhook endpoint answers
+// 503 "not configured" — that is the honest state, not an error.
 //
 // What this file does today:
 //   GET  /               landing page + the registration form. The page
@@ -14,21 +14,22 @@
 //                        what they are creating before clicking.
 //   GET|POST /setup/callback?code=...
 //                        the manifest-flow conversion: exchanges the
-//                        temporary code for the new App's credentials
-//                        and shows them ONCE, in this response only.
-//                        Nothing is logged, nothing is persisted — there
-//                        is deliberately no storage binding on this
-//                        Worker. The human copies the credentials into
-//                        secure storage (see README's runbook).
-//   POST /webhook        signature-verified event intake (202 + one
-//                        structured log line per event). No derivation
-//                        yet — that is the next M1 step, after
-//                        registration.
-//   GET  /health         {"status":"dark",...} until registration.
+//                        temporary code and stores the FULL conversion
+//                        JSON in CREDS under "app". The rendered page
+//                        shows only success, the app id, its html_url,
+//                        and the owner login — no secret value ever
+//                        appears in a response or a log.
+//   POST /webhook        signature-verified event intake. The webhook
+//                        secret is read from the stored CREDS "app"
+//                        record. Verified events are appended to a
+//                        capped ring in CREDS under "events" (202).
+//                        No derivation yet — that is the next M1 step.
+//   GET  /events         the recorded event ring, as JSON. Public by
+//                        design for the dogfood phase (see README).
+//   GET  /health         {"status":"dark",...} until CREDS holds an
+//                        "app" record, then {"status":"live",...}.
 //
-// The credentials returned by the conversion endpoint are shown to the
-// browser that completed the registration click and nowhere else. Do
-// not add logging to that path.
+// Do not add logging of the conversion response anywhere in this file.
 
 // The App Manifest, byte-identical to manifest.json in this repo.
 // deploy/deploy.py refuses to deploy if the two drift apart.
@@ -53,13 +54,6 @@ const MANIFEST = /*MANIFEST-BEGIN*/{
     "installation_repositories"
   ]
 }/*MANIFEST-END*/;
-
-const HANDLED_EVENTS = new Set([
-  "push",
-  "pull_request",
-  "installation",
-  "installation_repositories",
-]);
 
 function esc(s) {
   return String(s)
@@ -106,7 +100,7 @@ function landingPage() {
 <p><strong>Status: the GitHub App does not exist yet.</strong> This page is
 its future home and its registration desk. The receiver behind it is live
 but dark: it cannot accept webhooks until the App below is created and its
-webhook secret is configured.</p>
+credentials land in this Worker's store automatically.</p>
 <p>gitpp-app will bring git.pp to GitHub: when agents and humans complete
 work concurrently against the same shared state — configuration keys, task
 claims, release freezes — it derives one deterministic state from their
@@ -116,9 +110,11 @@ It resolves labelled key conflicts mechanically; it does not settle
 semantic conflicts.</p>
 <h2>What the button creates</h2>
 <p>Clicking the button below sends the manifest shown here — exactly this
-JSON, nothing hidden — to GitHub's App Manifest flow. GitHub will ask the
-signed-in account to confirm creating an app with this name, these
-permissions, and these events:</p>
+JSON, nothing hidden — to GitHub's App Manifest flow <strong>on the
+patchwork-quilt organisation's page</strong>, so the app will be owned by
+the patchwork-quilt org, not by a personal account. GitHub will ask you to
+confirm creating an app with this name, these permissions, and these
+events:</p>
 <pre>${esc(manifestJson)}</pre>
 <table>
 <tr><th>Permission</th><th>Level</th><th>Why</th></tr>
@@ -130,25 +126,30 @@ permissions, and these events:</p>
 Check's own output), no administration, no repository creation, no
 contents write. Events: push, pull_request, installation,
 installation_repositories.</p>
-<form action="https://github.com/settings/apps/new" method="post">
+<form action="https://github.com/organizations/patchwork-quilt/settings/apps/new" method="post">
 <input type="hidden" name="manifest" value="${esc(JSON.stringify(MANIFEST))}">
 <p><button type="submit">Create the gitpp-app GitHub App</button></p>
 </form>
 <p>After GitHub confirms, it redirects back here with a one-time code;
-this site exchanges it and shows the new App's credentials exactly once,
-for copying into secure storage. They are never stored or logged by
-this site.</p>`,
+this site exchanges it and stores the new App's credentials directly in
+its own credential store — nothing to copy, nothing to vault by hand.
+The confirmation page shows only the app's id, its GitHub URL, and the
+owning org; no secret value is ever displayed or logged by this
+site.</p>`,
   );
 }
 
 // UNTESTED BY DESIGN: this path can only be exercised by a real
 // registration click (GitHub issues the code only inside the manifest
 // flow, and each code is single-use). It will be verified on the day the
-// owner clicks — the runbook in README.md covers what to expect and
-// what to do with the output. Until then it sits dark, like the rest of
-// the app, and fails closed: a missing or rejected code shows an error
-// page and nothing else.
-async function setupCallback(url) {
+// owner clicks — the runbook in README.md covers what to expect. Until
+// then it sits dark, like the rest of the app, and fails closed: a
+// missing or rejected code shows an error page and nothing else.
+//
+// On success the FULL conversion JSON is stored in CREDS under "app"
+// and the page renders only non-secret fields. Secret values from the
+// conversion must never be rendered, logged, or copied anywhere else.
+async function setupCallback(url, env) {
   const code = url.searchParams.get("code");
   if (!code) {
     return page(
@@ -186,31 +187,33 @@ can be viewed under the app's settings on GitHub instead. Nothing was
 stored or logged here.</p>`,
     );
   }
-  // The credentials below are rendered into THIS response only. They are
-  // never written to any log, store, or header. If this page is missed,
-  // the private key cannot be recovered from here — GitHub holds it
-  // under the app's settings, where a new key can be generated.
+  // Store the full conversion record in the credential store. From
+  // here on, only non-secret fields are rendered — see below.
+  try {
+    await env.CREDS.put("app", JSON.stringify(conv));
+  } catch {
+    return page(
+      "gitpp-app — storage failed",
+      `<h1>Storage failed</h1>
+<p class="warn">GitHub created the app, but this receiver could not
+store its credentials. The app exists on GitHub; a fresh registration
+flow or a manual credential recovery under the app's GitHub settings
+is needed. No credential values were displayed or logged here.</p>`,
+    );
+  }
   return page(
     "gitpp-app — App created",
     `<h1>App created</h1>
-<p class="warn"><strong>Copy these credentials into secure storage
-now.</strong> This page is the only place this receiver will ever show
-them; it does not keep a copy. Hand them to the vault flow described in
-the README runbook, then configure the webhook secret on this Worker so
-the receiver leaves its dark state.</p>
+<p><strong>Success.</strong> The App's credentials were stored
+automatically in this Worker's credential store — there is nothing to
+copy and nothing to vault by hand. This receiver has left its dark
+state; install the App on a repository to start receiving events.</p>
 <table>
 <tr><th>Field</th><th>Value</th></tr>
-<tr><td>App</td><td>${esc(conv.html_url ?? "")}</td></tr>
 <tr><td>App ID</td><td>${esc(conv.id ?? "")}</td></tr>
-<tr><td>Slug</td><td>${esc(conv.slug ?? "")}</td></tr>
-<tr><td>Client ID</td><td>${esc(conv.client_id ?? "")}</td></tr>
-<tr><td>Webhook secret</td><td><code>${esc(conv.webhook_secret ?? "")}</code></td></tr>
-</table>
-<p>Private key (PEM) — store it in the vault, never in a repo:</p>
-<pre>${esc(conv.pem ?? "")}</pre>
-<p>Client secret (only needed for user-to-server OAuth flows; the
-receiver does not use it today):</p>
-<pre>${esc(conv.client_secret ?? "")}</pre>`,
+<tr><td>App</td><td>${esc(conv.html_url ?? "")}</td></tr>
+<tr><td>Owner</td><td>${esc(conv.owner?.login ?? "")}</td></tr>
+</table>`,
   );
 }
 
@@ -243,15 +246,28 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
+async function storedApp(env) {
+  if (!env.CREDS) return null;
+  const raw = await env.CREDS.get("app");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function webhook(request, env) {
-  // The honest dark state: no secret configured means this receiver was
+  // The honest dark state: no stored App record means this receiver was
   // never wired to a registered App. Say so, in so many words.
-  if (!env.WEBHOOK_SECRET) {
+  const app = await storedApp(env);
+  const secret = app?.webhook_secret;
+  if (!secret) {
     return Response.json({ error: "not configured" }, { status: 503 });
   }
   const bodyText = await request.text();
   const header = request.headers.get("x-hub-signature-256") ?? "";
-  const expected = "sha256=" + (await hmacHex(env.WEBHOOK_SECRET, bodyText));
+  const expected = "sha256=" + (await hmacHex(secret, bodyText));
   if (!constantTimeEqual(header, expected)) {
     return Response.json({ error: "signature mismatch" }, { status: 401 });
   }
@@ -260,44 +276,70 @@ async function webhook(request, env) {
   try {
     payload = JSON.parse(bodyText);
   } catch {
-    // A signature-valid body that is not JSON carries nothing to log.
+    // A signature-valid body that is not JSON carries nothing to record.
   }
-  // One structured line per event: what happened, where, under which
-  // installation. No payload bodies, no sender data beyond the login.
-  console.log(
-    JSON.stringify({
-      app: "gitpp-app",
-      event,
-      handled: HANDLED_EVENTS.has(event),
-      repo: payload?.repository?.full_name ?? null,
-      installation: payload?.installation?.id ?? null,
-      sender: payload?.sender?.login ?? null,
-      action: payload?.action ?? null,
-    }),
-  );
+  // Record a minimal ring entry: when, what event, which repo and
+  // installation, which action. No payload bodies, no other fields.
+  const entry = {
+    t: new Date().toISOString(),
+    event,
+    repo: payload?.repository?.full_name ?? null,
+    installation: payload?.installation?.id ?? null,
+    action: payload?.action ?? null,
+  };
+  let ring = [];
+  try {
+    const raw = await env.CREDS.get("events");
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) ring = parsed;
+  } catch {
+    ring = [];
+  }
+  ring.push(entry);
+  ring = ring.slice(-20);
+  await env.CREDS.put("events", JSON.stringify(ring));
+  console.log(JSON.stringify({ app: "gitpp-app", ...entry }));
   // No derivation yet: accepting and recording is the whole job until
-  // the App is registered and M1's derivation step lands.
+  // M1's derivation step lands.
   return Response.json({ accepted: true }, { status: 202 });
+}
+
+async function events(env) {
+  let ring = [];
+  if (env.CREDS) {
+    try {
+      const raw = await env.CREDS.get("events");
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed)) ring = parsed;
+    } catch {
+      ring = [];
+    }
+  }
+  return Response.json(ring);
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
+      const registered = (await storedApp(env)) !== null;
       return Response.json({
-        status: "dark",
+        status: registered ? "live" : "dark",
         app: "gitpp-app",
-        registered: false,
+        registered,
       });
     }
     if (url.pathname === "/" && request.method === "GET") {
       return landingPage();
     }
     if (url.pathname === "/setup/callback") {
-      return setupCallback(url);
+      return setupCallback(url, env);
     }
     if (url.pathname === "/webhook" && request.method === "POST") {
       return webhook(request, env);
+    }
+    if (url.pathname === "/events" && request.method === "GET") {
+      return events(env);
     }
     return Response.json({ error: "not found" }, { status: 404 });
   },
