@@ -1,107 +1,331 @@
 # gitpp-app
 
-**git.pp, as a GitHub App: when agents and humans finish work
-concurrently against the same shared state, gitpp-app derives the one
-deterministic state from their provenance-carrying records and posts
-it as a Check on the pull request — winner, preserved losers, and the
-ancestry that decided.** For teams running several coding agents
-against shared configuration, task claims, and release state, who are
-tired of untangling collisions by hand and losing the losing work.
+**gitpp-app watches a repository's provenance-carrying git.pp records,
+derives the one deterministic state from them, and posts that state as
+a Check on the pull request — the winning value, the preserved losers,
+and the ancestry that decided.**
 
-Part of the git.pp family (patchwork-quilt). The fold specification
-and conformance corpus live in `git.pp-ng`; this repo is only the
-GitHub-facing receiver and, once registered, the App.
+For teams running several coding agents — or agents plus humans —
+against the same shared state (configuration keys, task claims,
+release freezes), who are tired of untangling collisions by hand and
+silently losing the losing work. Not for code-level merge conflicts:
+the fold resolves *labelled key* conflicts mechanically, and this
+document says plainly where that boundary sits.
 
-## Status
+Today, the receiver half of that sentence is live and the derivation
+half is the next build. The status section below says exactly which
+is which, before you depend on either.
 
-**Receiver live, App unregistered — dark by design.** The Worker in
-this repo is deployed at <https://gitpp-app.superinstance.dev> ahead
-of registration, so the owner's one click has somewhere real to land:
+## Run it now: look at the live instance
 
-- `GET /` — what the App will be, and the registration desk: the
-  exact manifest the button sends to GitHub, rendered in full.
-- `GET /health` — `{"status":"dark","app":"gitpp-app","registered":false}`
-  until the App's record lands in the credential store, then
-  `{"status":"live",...,"registered":true}`.
-- `POST /webhook` — answers `503 {"error":"not configured"}` until a
-  registered App's record exists in the Worker's credential store
-  (the `CREDS` KV namespace, where the callback puts it). That is
-  the honest state, not an error. Verified events are recorded in a
-  capped ring (last 20) in the same store: timestamp, event, repo,
-  installation, action — nothing else.
-- `GET /events` — that recorded ring, as JSON. **Public by design
-  for the dogfood phase** — it is the proof surface that events are
-  arriving. It carries no payload bodies and no sender data, and it
-  gets gated before any Marketplace step.
-- No derivation yet: the receiver accepts and records events;
-  deriving state from them is the next M1 step, after registration.
+This App is registered and running. The smallest complete thing you
+can do with it right now is look at it:
 
-## The permission manifest, in plain words
+```sh
+curl https://gitpp-app.superinstance.dev/health
+# {"status":"live","app":"gitpp-app","registered":true}
 
-`manifest.json` in this repo is what GitHub will be asked to create.
-Read tier only:
+curl https://gitpp-app.superinstance.dev/events
+# [{"t":"2026-10-22T00:43:43.700Z","event":"push",
+#   "repo":"patchwork-quilt/gitpp-demo-quilt","installation":173944467,
+#   "action":null},
+#  {"t":"2026-10-22T00:43:44.987Z","event":"check_suite",
+#   "repo":"patchwork-quilt/gitpp-demo-quilt","installation":173944467,
+#   "action":"requested"}]
+```
+
+What just happened: `/health` reports that a registered App's record
+is sitting in the Worker's credential store. `/events` is the ring of
+webhook deliveries the receiver has accepted — an entry exists only
+if its HMAC signature verified against the App's webhook secret
+first. The two entries above are from registration day: a push to the
+dogfood repository this App is installed on, and the check suite
+GitHub requested alongside it. The ring is live; it holds the last 20
+verified deliveries, newest last.
+
+## Status — what exists, what does not
+
+**Exists (verified 2026-10-21):**
+
+- The App itself: `gitpp-app`, App ID 5419092,
+  <https://github.com/apps/gitpp-app>, owned by the patchwork-quilt
+  org, registered through the App Manifest flow from this repo's
+  landing page.
+- One installation: on `patchwork-quilt/gitpp-demo-quilt`, and no
+  other repository (installation ID 173944467).
+- Signature-verified webhook intake: the receiver verifies
+  `X-Hub-Signature-256` against the stored webhook secret and
+  records each accepted delivery in the ring above.
+- The App's credentials, held in the Worker's `CREDS` KV store —
+  never in this repo, never rendered in a page or a log.
+
+**Does not exist yet:**
+
+- **The derivation step.** On a push, the receiver verifies the
+  delivery, records it, and answers 202. It does **not** yet fetch
+  the repository's records, fold them, or post a Check. That is the
+  next build, and until it lands, installing this App gives you a
+  verified event log — not derived state on your pull requests.
+
+One cosmetic leftover: the landing page at
+<https://gitpp-app.superinstance.dev> still presents the registration
+desk, including copy written before the App existed. Read it as the
+register-your-own entry point (below), not as a status page.
+
+## The model
+
+Five concepts, in the order they compose:
+
+- **Record** — a JSON claim about one key of shared state: the value,
+  who asserted it, and which records it descends from (its ancestry).
+  Records are files in the repository, written by agents and humans
+  through ordinary git.
+- **Fold** — the deterministic derivation over a set of records. For
+  each key it names one winner; every loser is preserved and remains
+  cloneable. The tie-break is ancestry — *arrival order is never an
+  input*. The fold's specification and conformance corpus live in
+  `git.pp-ng`; this repo does not redefine them.
+- **Webhook intake** — GitHub delivers events to the receiver, which
+  verifies the HMAC-SHA-256 signature, records a five-field summary
+  (time, event, repo, installation, action — never payload bodies),
+  and acknowledges immediately.
+- **Installation** — the App acts per installation, with an
+  installation access token minted from its private key. The token
+  this App actually received carries exactly the manifest's
+  permissions: checks write, contents read, metadata read (observed
+  at mint time, 2026-10-21).
+- **Check** — the output surface the derivation step will write: a
+  check run on the pull request whose output carries the derived
+  state and the deciding ancestry. This is also why the ancestry
+  needs no pull-request permission: it rides in the Check's own
+  output, not in comments.
+
+```
+agent / human ──push records──▶ GitHub ──webhook (HMAC-signed)──▶ this Worker
+Worker: verify signature → record delivery → 202        ✓ live today
+        └─▶ fetch records → fold → post Check            ✗ next build
+```
+
+### Endpoints, and how each behaves
+
+| Route | Behaviour |
+|---|---|
+| `GET /` | Landing page and registration desk. Renders the exact manifest JSON a registration would send, next to the permission table. |
+| `GET /health` | `{"status":"live","app":"gitpp-app","registered":true}` once a registered App's record is in the `CREDS` store. A fresh deployment with an empty store answers `{"status":"dark",...,"registered":false}` — that is the honest pre-registration state, not an error. |
+| `POST /webhook` | No stored App record → `503 {"error":"not configured"}`. Stored record → signature verified: mismatch → `401`, nothing recorded; match → delivery recorded, `202`. |
+| `GET /events` | The recorded ring as JSON (last 20, newest last). **Public by design for the dogfood phase** — it is the proof surface that events are arriving. It carries no payload bodies and no sender data, and it gets gated before any Marketplace step. |
+| `GET\|POST /setup/callback` | The manifest-flow conversion endpoint. Exchanges the single-use code GitHub redirects with, stores the resulting App record in `CREDS`, and renders only the App's id, URL, and owner login. |
+
+Failure behaviour, stated:
+
+- **Wrong signature** → `401`; nothing is recorded.
+- **Signature-valid body that is not JSON** → recorded with null
+  repo/action fields; a valid signature with an unparseable body
+  carries nothing else to extract.
+- **Missing or rejected manifest code** at the callback → an error
+  page, nothing stored. Codes are single-use and short-lived; the
+  endpoint fails closed.
+- **Credential-store write failure** during conversion → a "Storage
+  failed" page. The App still exists on GitHub; the recovery is in
+  the runbook below. This has happened once — see *The binding that
+  vanished*.
+
+## Permissions — the manifest, in plain words
+
+`manifest.json` in this repo is byte-identical to the manifest the
+App was registered with (`deploy/deploy.py` refuses to deploy if
+the copy embedded in `worker.js` drifts from it). Read tier only:
 
 | Permission | Level | Why |
 |---|---|---|
-| Metadata | Read | Platform baseline. |
-| Contents | Read | Read the record files. **GitHub grants Contents repository-wide; there is no path-scoped grant.** The app touches record paths only as a matter of published policy and open source — the limit is policy, enforced by this code being public, not by the grant itself. This sentence is the honest version and it is the version the listing will carry. |
-| Checks | Write | Post the derived state as a Check run. |
+| Metadata | Read | Platform baseline: which repos exist, who installed the App. |
+| Contents | Read | To read the record files. **GitHub grants Contents repository-wide; there is no path-scoped grant.** The App touches record paths only as a matter of published policy and open source — the limit is policy, enforced by this code being public, not by the grant itself. This sentence is the honest version, and it is the version any listing will carry. |
+| Checks | Write | To post the derived state as a Check run (once the derivation step lands). |
 
-Nothing else: no pull-request permission (the deciding ancestry
-rides in the Check's own output), no administration, no repository
-creation, no contents write. Events: `push`, `pull_request`,
-`installation`, `installation_repositories`.
+Nothing else: no pull-request permission, no administration, no
+repository creation, no contents write.
 
-What the Check does and does not claim, in the specification's own
-terms: it resolves **labelled key conflicts mechanically**; it does
-**not** settle semantic conflicts; content digests authenticate
-*content*, not authorship; and the resolution rule's tie-break is
-ancestry — **arrival order is never an input**.
+**Events: `push` and `check_suite` — and the two absences are both
+deliberate.** `pull_request` is absent because GitHub's manifest
+validation rejected it: those events require the `pull_requests`
+permission, which this App does not request (the ancestry rides in
+the Check output instead). `installation` and
+`installation_repositories` are absent because GitHub delivers
+installation events to every App by default and refuses them as
+manifest declarations. Receipt: the 2026-10-21 rejection and
+correction are in this repo's git history (`07fc1a3`), and the
+registered manifest above is what survived validation.
 
-Collection cost, and why the receiver is built webhook-fed with
-clone-class (tarball) collection rather than per-file REST reads,
-is modelled in [BUDGET.md](BUDGET.md).
+## Honest limits
 
-## Registration runbook (the owner, once)
+- No derivation yet — see Status. The Check this App will post is
+  designed, not built.
+- The fold resolves labelled key conflicts mechanically. It does
+  **not** settle semantic conflicts, and a gitpp Check must never be
+  read as claiming it did.
+- Content digests authenticate *content*, not authorship. A
+  record's ancestry says what it descends from, not who is honest.
+- Contents read is repository-wide by platform design; the
+  record-paths-only limit is policy and public code, not the grant.
+- `/events` is public metadata during the dogfood phase.
 
-**Timing: the whole flow — click, GitHub's confirmation, and the
-callback exchange — must complete within one hour** (GitHub expires
-the manifest code). Start it when you have ten unhurried minutes;
-it takes two.
+## The deep layer
 
+### Why this is an App at all — the Checks API refuses Actions tokens
 
-That is the owner's whole job:
+Creating a check run requires a GitHub App token (or a fine-grained
+PAT). A workflow's built-in `GITHUB_TOKEN` is refused by the Checks
+API endpoints — verified against GitHub's Checks API documentation,
+2026-10-21, in the programme's platform-facts record. That single
+platform fact forces the family's shape: **gitpp-action** advises
+from inside CI, where its native surface is the job summary; only an
+App can post the real Check. If you arrived here wanting the fold in
+your pipeline today with no install, the Action is the door — see
+the shelf below.
 
-1. Open <https://gitpp-app.superinstance.dev>. Read the manifest on
-   the page — it is byte-identical to `manifest.json` here; the
-   deploy script refuses to deploy if they drift.
-2. Click **Create the gitpp-app GitHub App**. The form submits to
-   the patchwork-quilt organisation's GitHub page, so the App will
-   be owned by the org. Confirm on GitHub, within the one-hour
-   window above. (Manifest-flow names are first-come; if `gitpp-app`
-   is taken, GitHub will say so at this step, and the name in both
-   files gets adjusted before retrying.)
-3. Done. GitHub redirects back to `/setup/callback`, which exchanges
-   the one-time code and stores the App's credentials directly in
-   the Worker's credential store (the `CREDS` KV namespace)
-   automatically. **Nothing to copy, nothing to vault by hand, and
-   no secret ever appears in a page, a chat, or a log** — the
-   confirmation page shows only that it succeeded, the App ID, its
-   GitHub URL, and the owner login. `/health` flips to
-   `registered: true` / `status: "live"`, and `/webhook` starts
-   answering 202 to signature-valid events.
-4. Install the App on one repository (GitHub's install flow,
-   per-repo selection) and open a test PR. Recorded events appear
-   at `/events`; derivation arrives with the next M1 step.
+### The limit that actually binds is not the famous one
+
+An installation token's primary limit — 5,000 requests/hour — is a
+*floor* that scales with repos and users (to 12,500; 15,000 on
+GHEC). The constraint that binds this App's design is the secondary
+limit: **80 content-generating requests per minute, 500 per hour**.
+Posting a Check is content-generating. So derivation must coalesce
+per commit instead of firing per event: a burst of pushes to one
+branch is one fold and one Check update, not one per webhook. This
+is a design requirement, not an optimisation, and it is stated
+before the derivation step is built so the build inherits it.
+(BUDGET.md §1, with the correction recorded there.)
+
+The same document does the collection arithmetic. Reading records
+file-by-file over REST costs N+2 API calls per derivation; at the
+demo scale of 62 records and a modelled 900 derivations/day, that
+is ≈ 5,940 calls/hour — over the primary floor before any other
+API use. Clone-class collection (one fetch operation plus bytes —
+a tarball on Workers, which has no git binary) lands at ≈ 180 REST
+calls/hour, about 4% of the budget, with the real cost moved to
+bandwidth and fold CPU, which are ours to provision. That is why
+the receiver is webhook-fed and why the fold's checkpoint/delta
+machinery matters: repeat derivations re-read a frontier and a
+tail, not the world. BUDGET.md is labelled a model, not a
+measurement — read it as one.
+
+### The 10-second acknowledgment shapes the receiver
+
+GitHub expects a webhook endpoint to respond within 10 seconds, so
+everything expensive lives behind the acknowledgment. What the
+receiver does inside the window is deliberately small: verify the
+signature, record five fields, answer 202. `worker.js` is one file
+and the intake path is most of it — the smallness is the design,
+and the derivation step is being built to run behind the ack, never
+inside it.
+
+### The binding that vanished
+
+On registration day, the conversion callback reported "Storage
+failed": GitHub had created the App, but the receiver stored
+nothing. Root cause: the Worker script-upload route silently drops
+non-secret bindings on this account, so the `CREDS` KV binding —
+declared in the deploy metadata all along — was not attached at
+runtime, and the callback's write had nowhere to land. The manifest
+code was single-use, so the credentials were recovered from the
+App's GitHub settings instead (a fresh webhook secret and a
+generated private key, written into `CREDS` from the operator
+side), and `/health` flipped to live when the record landed.
+
+The generalised lesson is baked into `deploy/deploy.py`: after
+every upload it re-attaches the bindings through the settings
+PATCH route, which is the route that holds. A deploy that reports
+success is not evidence the bindings exist; verify the settings,
+not the upload response.
+
+### Verify it yourself
+
+- `curl https://gitpp-app.superinstance.dev/health` and `/events` —
+  the outputs at the top of this document, reproducible now.
+- Webhook negatives: `POST /webhook` with no valid signature and
+  watch it refuse (`401` against the live instance; `503` against
+  any deployment whose store is still empty).
+- Manifest integrity: `python3 deploy/deploy.py` refuses to deploy
+  if the manifest embedded in `worker.js` differs from
+  `manifest.json`, and prints the comparison before uploading.
+- Fold claims trace sideways, not to this README: the engine the
+  derivation step will call is specified in `git.pp-ng`, and its
+  measured ledger is that repo's RESULTS.md (three independent
+  ports passing one conformance corpus byte-identically). Anything
+  here that reads as a claim about the fold should be checked
+  there.
+
+## Registration
+
+### How this instance was registered
+
+On 2026-10-21, through the App Manifest flow starting from this
+repo's landing page, so the App is owned by the patchwork-quilt
+org: **gitpp-app, ID 5419092, <https://github.com/apps/gitpp-app>**.
+It is installed on exactly one repository,
+`patchwork-quilt/gitpp-demo-quilt` (installation 173944467). The
+first submission was rejected by GitHub's manifest validation over
+the event list; the correction narrowed the events and never
+widened a permission. The callback's credential store failed once
+(*The binding that vanished*, above) and the credentials were
+recovered via the App's settings; the record now lives in the
+`CREDS` KV namespace (title `gitpp-app-creds`) under the key `app`,
+with the delivery ring under `events`.
+
+### Register your own
+
+1. Deploy the Worker first (see Deploy), so your
+   `/setup/callback` exists.
+2. Choose an unused app name — manifest names are first-come. Set
+   it, plus `url`, `hook_attributes.url`, and `redirect_url` for
+   your deployment, in **both** `manifest.json` and the manifest
+   embedded in `worker.js`; the deploy script refuses to ship if
+   they differ.
+3. Open the landing page and read the manifest it renders — it is
+   exactly what the form sends. Submit, and confirm on GitHub.
+   **The whole flow — click, GitHub's confirmation, and the
+   callback exchange — must complete within one hour**; GitHub
+   expires the manifest code. It takes two unhurried minutes.
+4. The callback exchanges the code and stores the App's record in
+   the `CREDS` store automatically — nothing to copy, nothing to
+   vault by hand, and no secret ever appears in a page or a log.
+   The confirmation page shows only the App's id, its GitHub URL,
+   and the owner login. `/health` flips to `registered: true`.
+5. Install the App on one repository (per-repo selection in
+   GitHub's install flow) and push. Verified deliveries appear at
+   `/events`.
+6. If the callback shows "Storage failed": the App still exists on
+   GitHub. Under the App's settings, set a webhook secret and
+   generate a private key, then write the record — app id,
+   webhook secret, PEM — as JSON into your `CREDS` namespace
+   under `app`. That is the recovery this instance used.
 
 ## Deploy
 
-`deploy/deploy.py` uploads `worker.js` via the fleet's OAuth route
-and asserts the embedded manifest matches `manifest.json`. The
-deploy metadata binds the `CREDS` KV namespace (title
-`gitpp-app-creds`), which holds the stored App record under `app`
-and the event ring under `events`. The hostname is a Workers Custom
-Domain on the same script.
+`python3 deploy/deploy.py` uploads `worker.js` via the fleet's
+OAuth route, asserts the embedded manifest matches `manifest.json`
+(refusing on drift), re-attaches the `CREDS` KV binding via the
+settings PATCH after every upload (see *The binding that vanished*),
+and attaches the `gitpp-app.superinstance.dev` Workers Custom
+Domain. The KV namespace id is in `deploy/metadata.json`.
+
+## The shelf
+
+One tool, one repo — take the one whose shape fits:
+
+- **[gitpp-action](https://github.com/patchwork-quilt/gitpp-action)**
+  — the fold as a GitHub Action. Start here to get derived state in
+  your own CI today: no install, no App, removable by deleting one
+  workflow file. Its native surface is the job summary.
+- **[git.pp-ng](https://github.com/patchwork-quilt/git.pp-ng)** —
+  the specification, the fold engine, the conformance corpus, and
+  RESULTS.md, the measured ledger. Read it to know exactly what
+  the fold does and does not claim.
+- **[gitpp-demo-quilt](https://github.com/patchwork-quilt/gitpp-demo-quilt)**
+  — the dogfood repository this App is installed on: the
+  poc-quilt-1 record set hosted on GitHub under `.gitpp/records`,
+  whose derived state is `config.timeout = 45`, winner
+  `override-1`, losers preserved.
 
 ## Licence
 
