@@ -49,6 +49,30 @@ def main():
     if not r.get("success"):
         return 1
 
+    # The scripts PUTM silently drops non-secret bindings on this
+    # account (learned 2026-10-21: the CREDS KV binding vanished and
+    # the registration callback failed to store). Re-attach via the
+    # settings PATCH, which is the route that holds.
+    import urllib.request, urllib.error, uuid as _uuid
+    binds = [{"name": kv["binding"], "type": "kv_namespace", "namespace_id": kv["id"]}
+             for kv in metadata.get("kv_namespaces", [])]
+    if binds:
+        tok = cf_oauth.access_token()
+        boundary = "----cfpatch" + _uuid.uuid4().hex
+        payload = json.dumps({"bindings": binds}).encode()
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"settings\"\r\nContent-Type: application/json\r\n\r\n".encode()
+                + payload + b"\r\n" + f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/scripts/{SCRIPT}/settings",
+            data=body, method="PATCH")
+        req.add_header("Authorization", f"Bearer {tok}")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        try:
+            out = json.loads(urllib.request.urlopen(req, timeout=60).read())
+        except urllib.error.HTTPError as e:
+            out = json.loads(e.read())
+        print("bindings patch:", out.get("success"), "| errors:", out.get("errors"))
+
     domains = cf_oauth.request(
         "GET", f"/client/v4/accounts/{ACCOUNT}/workers/domains"
     )
