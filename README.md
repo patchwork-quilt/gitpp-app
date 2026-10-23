@@ -183,6 +183,11 @@ reading the code:
   rejected **by name** in the Check; a key removed from the
   declaration lists its records under **Retired** — preserved on
   the branch, revived by re-declaring — never silently dropped.
+  Two records carrying one id with different content are likewise
+  rejected by name (identical copies dedupe; differing ones never
+  settle silently), and a proposal that reuses a landed record's
+  id says so in its verdict, naming the landed effects it would
+  drop.
   And because a force-push can make records vanish without any
   record saying so, each derivation diffs the branch's record-id
   set against the last derived one and names any vanished ids in a

@@ -1884,6 +1884,35 @@ function truncErr(msg) {
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
 }
 
+/** Value-depth bound for one record (adversarial round 1, F6). The
+ * fold's canonicalisation walks values recursively, so one
+ * well-formed record carrying a pathologically deep value (the
+ * probe nested 10,000 levels) aborted the whole derivation with a
+ * stack error — every key on the surface, for one record's shape.
+ * The gate refuses the record BY NAME instead, keeping the blast
+ * radius at one record. 100 levels is the bound: real coordination
+ * values nest a handful of levels (the freeze window is two), so
+ * 100 is ~an order of magnitude past any plausible record, while
+ * recursive walks over ≤100 levels sit nowhere near stack limits. */
+const MAX_VALUE_DEPTH = 100;
+
+/** Depth of a JSON value, iteratively (the walk itself must not be
+ * the recursion it guards against): a scalar is 0, an empty
+ * container is 1, a container is 1 + its deepest child. Stops as
+ * soon as the bound is exceeded — the exact depth past it is never
+ * needed. */
+function valueDepthExceeds(v) {
+  const stack = [[v, 0]];
+  while (stack.length > 0) {
+    const [cur, d] = stack.pop();
+    if (cur !== null && typeof cur === "object") {
+      if (d + 1 > MAX_VALUE_DEPTH) return true;
+      for (const child of Object.values(cur)) stack.push([child, d + 1]);
+    }
+  }
+  return false;
+}
+
 function gateRecord(candidate, file, index) {
   const reject = (error) => ({
     reject: {
@@ -1917,6 +1946,28 @@ function gateRecord(candidate, file, index) {
   }
   if (candidate.kind !== undefined && typeof candidate.kind !== "string") {
     return reject("kind is present but is not a string");
+  }
+  // Value-depth bound (F6): a pathologically deep value anywhere in
+  // the record is refused here, by name, instead of aborting the
+  // derivation downstream. Effect values are named individually —
+  // that is the probe's shape and the common case.
+  for (const [field, value] of Object.entries(candidate)) {
+    if (value === null || typeof value !== "object") continue;
+    if (field === "effects" && isPlainObject(value)) {
+      for (const [k, ev] of Object.entries(value)) {
+        if (ev !== null && typeof ev === "object" && valueDepthExceeds(ev)) {
+          return reject(
+            `effect "${k}" nests deeper than the ${MAX_VALUE_DEPTH}-level value-depth limit`,
+          );
+        }
+      }
+      continue;
+    }
+    if (valueDepthExceeds(value)) {
+      return reject(
+        `field "${field}" nests deeper than the ${MAX_VALUE_DEPTH}-level value-depth limit`,
+      );
+    }
   }
   return { record: candidate };
 }
@@ -1963,6 +2014,60 @@ function gateRecordFile(text, file, records, rejects, entries) {
   }
 }
 
+/** Collection-layer duplicate-id resolution (issue #11, adversarial
+ * round 1 F1). The spec's collection layer dedupes by id — but
+ * dedupe is only defined for the SAME record arriving twice. Two
+ * records carrying one id with DIFFERENT canonical content are not
+ * a duplicate; they are a contradiction the fold's id index would
+ * silently settle by overwrite (the survivor picked by canonical
+ * sort, invisible to any reader, while the count still claimed
+ * both). Resolution, at intake, for every collection this app
+ * reads (Mapping A records, surface landed records, proposals):
+ * group by id; identical canonical content (indexKey — the same
+ * canonical form the engine indexes by, digest field aside) keeps
+ * the first copy, silently, as the spec's dedupe intends; differing
+ * content rejects EVERY record with that id, one reject per file,
+ * each naming the id and all the files involved — neither record
+ * derives, and children of the id orphan by name downstream, as
+ * with any excluded record. Returns the kept entries in first-seen
+ * order; rejects are appended to the given sink in the shared
+ * {file, error} shape both renderers already print. */
+function dedupeRecordEntries(entries, rejects) {
+  const groups = new Map();
+  for (const e of entries) {
+    const id = String(e.record.id);
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(e);
+  }
+  const kept = [];
+  for (const [id, group] of groups) {
+    if (group.length === 1) {
+      kept.push(group[0]);
+      continue;
+    }
+    const firstKey = indexKey(group[0].record);
+    if (group.every((e) => indexKey(e.record) === firstKey)) {
+      kept.push(group[0]);
+      continue;
+    }
+    const files = [...new Set(group.map((e) => e.file))];
+    const shown = files.slice(0, 5).map((f) => `\`${f}\``);
+    if (files.length > shown.length) {
+      shown.push(`and ${files.length - shown.length} more file(s)`);
+    }
+    const where = shown.join(" and ");
+    for (const f of files) {
+      rejects.push({
+        file: f,
+        error:
+          `duplicate record id \`${id}\` — ${group.length} records carry this id ` +
+          `with different content (${where}); none of them derived`,
+      });
+    }
+  }
+  return kept;
+}
+
 async function fetchRecords(token, repo, sha) {
   const res = await fetch(
     `https://api.github.com/repos/${repo}/tarball/${sha}`,
@@ -1991,6 +2096,7 @@ async function fetchRecords(token, repo, sha) {
   }
   const entries = parseTar(tar);
   const records = [];
+  const recordEntries = [];
   const rejects = [];
   const proposals = [];
   const proposalRejects = [];
@@ -2004,7 +2110,7 @@ async function fetchRecords(token, repo, sha) {
       if (recordFileCount > MAX_RECORD_FILES) {
         throw new TooLargeError(`more than ${MAX_RECORD_FILES} record files`);
       }
-      gateRecordFile(e.text, displayPath(e.name), records, rejects);
+      gateRecordFile(e.text, displayPath(e.name), records, rejects, recordEntries);
     } else if (PROPOSAL_PATH.test(e.name)) {
       // Mapping B proposals ride in the same tarball Mapping A already
       // fetched — collecting them costs no extra call. The Mapping A
@@ -2033,6 +2139,20 @@ async function fetchRecords(token, repo, sha) {
       }
     }
   }
+  // Duplicate-id resolution at intake (issue #11): identical copies
+  // dedupe silently; one id with differing content rejects every
+  // copy by name, in both collections this fetch gathers.
+  const keptRecordEntries = dedupeRecordEntries(recordEntries, rejects);
+  records.length = 0;
+  records.push(...keptRecordEntries.map((e) => e.record));
+  const keptProposalEntries = dedupeRecordEntries(
+    proposalEntries,
+    proposalRejects,
+  );
+  proposals.length = 0;
+  proposals.push(...keptProposalEntries.map((e) => e.record));
+  proposalEntries.length = 0;
+  proposalEntries.push(...keptProposalEntries);
   return {
     records,
     rejects,
@@ -2279,6 +2399,11 @@ async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
 //   surfinfo:<repo>          discovery cache {has, tipSha, tipTime,
 //                            checkedAt} — probed at most hourly, so
 //                            non-surface repos cost no per-push call.
+//                            Writes are monotonic in observation
+//                            time and state-push refreshes are
+//                            verified against the branch ref, so
+//                            the cache can never regress to a
+//                            superseded tip (issue #13).
 //   surfdecl:<repo>:<tipSha> the declaration as fetched at that tip.
 //   surfmanifest:<repo>      {ids, patterns, tipSha, at} from the
 //                            last posted surface derivation — the
@@ -2300,7 +2425,8 @@ async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
 
 const SURFACE_BRANCH = "gitpp/state";
 const SURFACE_CHECK_NAME = "git.pp surface";
-const SURFACE_FILE = /^[^/]+\/(surface\.json|records\/[^/]+\.json)$/;
+const SURFACE_FILE = /^[^/]+\/(surface\.json|records\/[^/]+\.json|\.gitpp\/proposals\/[^/]+\.json)$/;
+const SURFACE_STATE_PROPOSAL_PATH = /^[^/]+\/\.gitpp\/proposals\/[^/]+\.json$/;
 const SURFACE_JSON_PATH = /^[^/]+\/surface\.json$/;
 const SURFACE_RECORD_PATH = /^[^/]+\/records\/[^/]+\.json$/;
 const SURFACE_PROBE_TTL_MS = 3600 * 1000;
@@ -2327,6 +2453,10 @@ const SURFACE_GLOSSARY =
  * { surface } — patterns in declaration order, {pattern, prefix,
  * description} with prefix null for exact keys and the dotted prefix
  * ("task.claim.") for families — or { error }. */
+/** Bound on one declared key pattern's length (adversarial round
+ * 1, F8) — see the refusal in validateSurface. */
+const MAX_PATTERN_LENGTH = 200;
+
 function validateSurface(decl) {
   const bad = (error) => ({ error });
   if (!isPlainObject(decl)) return bad("surface.json is not a JSON object");
@@ -2345,6 +2475,16 @@ function validateSurface(decl) {
   for (const [pattern, spec] of Object.entries(decl.keys)) {
     if (pattern.length === 0) {
       return bad("surface.json declares an empty key name");
+    }
+    if (pattern.length > MAX_PATTERN_LENGTH) {
+      // Refused before any rule that would print the pattern back
+      // (adversarial round 1, F8): a pattern is rendered in full in
+      // the Check, so an unbounded one could evict the rest of the
+      // state table at the report budget. 200 chars is far past any
+      // real key name and keeps the rendered line to one line.
+      return bad(
+        `key pattern "${pattern.slice(0, 32)}…" is ${pattern.length} characters — key patterns are limited to ${MAX_PATTERN_LENGTH} characters`,
+      );
     }
     let prefix = null;
     if (pattern.includes("*")) {
@@ -2559,6 +2699,16 @@ function surfaceStateLines(surface, out, records) {
         : `- \`${p.pattern}\` — unset — ${p.description}`,
     );
   }
+  // One state line per concrete key (adversarial round 1, F7): a
+  // key governed by an EXACT declaration renders in the exact loop
+  // above, with the exact description ("exact beats family" is the
+  // matching rule) — the family loop must not render it a second
+  // time under the family's description. A family whose matching
+  // keys are all exact-governed prints no line of its own; "no keys
+  // set" is reserved for a family nothing in state matches at all.
+  const exactKeys = new Set(
+    surface.patterns.filter((p) => p.prefix === null).map((p) => p.pattern),
+  );
   for (const p of surface.patterns) {
     if (p.prefix === null) continue;
     const concrete = Object.keys(out.state)
@@ -2566,8 +2716,10 @@ function surfaceStateLines(surface, out, records) {
       .sort(cmpCodePoints);
     if (concrete.length === 0) {
       lines.push(`- \`${p.pattern}\` — no keys set — ${p.description}`);
+      continue;
     }
     for (const k of concrete) {
+      if (exactKeys.has(k)) continue;
       const w = winnerOf(k);
       lines.push(
         `- \`${k}\` = ${fmtValue(out.state[k])} — ${winText(w)} — ${p.description}`,
@@ -2603,6 +2755,24 @@ function proposalVerdicts(landedGate, propGate, union) {
         `- proposal \`${pid}\` — identical to the landed record of the same id; no change if landed again`,
       );
       continue;
+    }
+    if (landedTwin) {
+      // Same id, different content (issue #12): the union replaces
+      // the landed record WHOLESALE, so every landed effect the
+      // proposal does not restate drops out of the union state.
+      // The per-key verdicts below only speak for keys the proposal
+      // sets; this line speaks for the ones it silently removes —
+      // named, with the values that would be lost.
+      const landedEff = effectsOf(landedTwin);
+      const propEff = effectsOf(p);
+      const dropped = Object.keys(landedEff)
+        .filter((k) => !(k in propEff))
+        .sort(cmpCodePoints);
+      lines.push(
+        dropped.length > 0
+          ? `- proposal \`${pid}\` replaces the landed record of the same id wholesale; landed effect(s) it does not restate would drop: ${dropped.map((k) => `\`${k}\` = ${fmtValue(landedEff[k])}`).join(", ")}`
+          : `- proposal \`${pid}\` replaces the landed record of the same id wholesale; it restates every landed effect, so no landed effect would drop`,
+      );
     }
     for (const k of Object.keys(effectsOf(p)).sort(cmpCodePoints)) {
       const v = fmtValue(effectsOf(p)[k]);
@@ -2788,6 +2958,22 @@ function renderSurfaceReport(args) {
       lines.push(...retiredLines.slice(0, retiredLines.length - dropRetired));
       if (dropRetired > 0) lines.push(TRUNC_MARKER(dropRetired));
     }
+    const stateProposalFiles = args.landed.stateProposalFiles ?? [];
+    if (stateProposalFiles.length > 0) {
+      // Proposal files that landed ON gitpp/state (issue #14): not
+      // read — proposals are read from proposed branches — and not
+      // silent either.
+      const shownFiles = stateProposalFiles
+        .slice(0, 10)
+        .map((f) => `\`${f}\``)
+        .join(", ");
+      lines.push("", "## Notes", "");
+      lines.push(
+        `- ${stateProposalFiles.length} proposal file(s) found on \`gitpp/state\` (${shownFiles}` +
+          `${stateProposalFiles.length > 10 ? `, and ${stateProposalFiles.length - 10} more` : ""}) — ` +
+          "proposals are read from proposed branches, not from `gitpp/state`; these were ignored.",
+      );
+    }
     if (mode === "preview") {
       lines.push(
         "",
@@ -2919,6 +3105,76 @@ async function resolveTipTime(token, repo, tipSha) {
   return null;
 }
 
+/** Write a surfinfo discovery entry, monotonically (issue #13,
+ * adversarial round 1 F3). Every entry carries the time its tip
+ * was OBSERVED (checkedAt = when the writer read the branch ref or
+ * the push payload, never when the write happens to land), and a
+ * write whose observation is older than the standing entry's is
+ * refused: twin jobs and successive state pushes run out of order,
+ * and before this guard the d63845d derivation could write its tip
+ * after the 0def287 derivation wrote its own, leaving the cache —
+ * and the next working-branch Check — deriving a superseded tip.
+ * Returns whether the write landed. */
+async function writeSurfinfo(env, repo, entry, observedAt) {
+  const key = `surfinfo:${repo}`;
+  try {
+    const raw = await env.CREDS.get(key);
+    if (raw) {
+      const cur = JSON.parse(raw);
+      if (
+        cur &&
+        typeof cur.checkedAt === "number" &&
+        cur.checkedAt > observedAt
+      ) {
+        return false;
+      }
+    }
+  } catch {}
+  try {
+    await env.CREDS.put(
+      key,
+      JSON.stringify({ ...entry, checkedAt: observedAt }),
+      { expirationTtl: 3600 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Refresh the discovery cache from a state-branch push (issue
+ * #13). The pushed sha is what the branch WAS at push time; by the
+ * time this job runs the branch may have advanced again or been
+ * force-restored, so the entry is verified against the branch ref
+ * itself and the cache records the ref's CURRENT tip — a state
+ * push can therefore never write a tip that was already superseded
+ * when the write lands. One ref read per state-push derivation
+ * (plus a commit read when the ref has moved); the token is the
+ * module-cached one. Falls back to the pushed sha when the ref
+ * read fails: the push's own after is the best evidence available,
+ * and the monotonic guard still orders the write. */
+async function refreshSurfinfo(env, token, repo, pushedSha, pushedTime) {
+  let tipSha = pushedSha;
+  try {
+    const refRes = await ghGet(
+      token,
+      `/repos/${repo}/git/ref/heads/${encodeURIComponent(SURFACE_BRANCH)}`,
+    );
+    if (refRes.ok) {
+      const refBody = await refRes.json();
+      if (typeof refBody?.object?.sha === "string" && refBody.object.sha) {
+        tipSha = refBody.object.sha;
+      }
+    }
+  } catch {}
+  const observedAt = Date.now();
+  const tipTime =
+    tipSha === pushedSha && pushedTime
+      ? pushedTime
+      : await resolveTipTime(token, repo, tipSha);
+  await writeSurfinfo(env, repo, { has: true, tipSha, tipTime }, observedAt);
+}
+
 async function probeSurfaceTip(env, token, repo) {
   const key = `surfinfo:${repo}`;
   try {
@@ -2939,32 +3195,142 @@ async function probeSurfaceTip(env, token, repo) {
     token,
     `/repos/${repo}/git/ref/heads/${encodeURIComponent(SURFACE_BRANCH)}`,
   );
+  const observedAt = Date.now();
+  info.checkedAt = observedAt;
   if (refRes.status === 404) {
-    try {
-      await env.CREDS.put(key, JSON.stringify(info), {
-        expirationTtl: 3600,
-      });
-    } catch {}
+    await writeSurfinfo(env, repo, info, observedAt);
     return info;
   }
   if (!refRes.ok) throw new Error(`surface probe HTTP ${refRes.status}`);
   const refBody = await refRes.json();
   const tipSha = refBody?.object?.sha ?? null;
   if (!tipSha) {
-    try {
-      await env.CREDS.put(key, JSON.stringify(info), {
-        expirationTtl: 3600,
-      });
-    } catch {}
+    await writeSurfinfo(env, repo, info, observedAt);
     return info;
   }
   info.has = true;
   info.tipSha = tipSha;
   info.tipTime = await resolveTipTime(token, repo, tipSha);
-  try {
-    await env.CREDS.put(key, JSON.stringify(info), { expirationTtl: 3600 });
-  } catch {}
+  await writeSurfinfo(env, repo, info, observedAt);
   return info;
+}
+
+/** Find a duplicated key name inside surface.json's top-level
+ * `keys` object, from the RAW text (issue #15, adversarial round 1
+ * F5). JSON.parse collapses duplicate object names last-wins
+ * before any validator can see them, so the ambiguity — two
+ * descriptions for one key, the legibility surface itself — has to
+ * be caught by scanning the text before parsing. A small walker:
+ * string tokens are decoded with JSON.parse (so an escaped name
+ * cannot smuggle a duplicate past), containers are skipped by
+ * balanced scan, and only the root object's own `keys` entry is
+ * descended into. Returns the first duplicated name, or null (also
+ * null on malformed text — the parse error path reports that). */
+function findDuplicateDeclarationKey(text) {
+  const n = text.length;
+  let i = 0;
+  const isWs = (c) => c === " " || c === "\t" || c === "\r" || c === "\n";
+  const skipWs = () => {
+    while (i < n && isWs(text[i])) i++;
+  };
+  const readString = () => {
+    if (text[i] !== '"') return null;
+    let j = i + 1;
+    while (j < n) {
+      if (text[j] === "\\") {
+        j += 2;
+        continue;
+      }
+      if (text[j] === '"') break;
+      j++;
+    }
+    if (j >= n) return null;
+    let value;
+    try {
+      value = JSON.parse(text.slice(i, j + 1));
+    } catch {
+      return null;
+    }
+    i = j + 1;
+    return value;
+  };
+  const skipValue = () => {
+    skipWs();
+    const c = text[i];
+    if (c === '"') return readString() !== null;
+    if (c === "{" || c === "[") {
+      const open = c;
+      const close = c === "{" ? "}" : "]";
+      let depth = 0;
+      while (i < n) {
+        const ch = text[i];
+        if (ch === '"') {
+          if (readString() === null) return false;
+          continue;
+        }
+        if (ch === open) depth++;
+        else if (ch === close) {
+          depth--;
+          if (depth === 0) {
+            i++;
+            return true;
+          }
+        }
+        i++;
+      }
+      return false;
+    }
+    while (i < n && !",}] \t\r\n".includes(text[i])) i++;
+    return true;
+  };
+  const scanObjectEntries = (onEntry) => {
+    i++; // consume '{'
+    skipWs();
+    if (text[i] === "}") {
+      i++;
+      return true;
+    }
+    for (;;) {
+      skipWs();
+      const name = readString();
+      if (name === null) return false;
+      skipWs();
+      if (text[i] !== ":") return false;
+      i++;
+      if (onEntry(name) === false) return false;
+      if (!skipValue()) return false;
+      skipWs();
+      if (text[i] === ",") {
+        i++;
+        continue;
+      }
+      if (text[i] === "}") {
+        i++;
+        return true;
+      }
+      return false;
+    }
+  };
+  skipWs();
+  if (text[i] !== "{") return null;
+  let dup = null;
+  const okScan = scanObjectEntries((name) => {
+    if (name !== "keys") return true;
+    let j = i;
+    while (j < n && isWs(text[j])) j++;
+    if (text[j] !== "{") return true; // not an object — the validator's error
+    const saved = i;
+    i = j;
+    const seen = new Set();
+    const okInner = scanObjectEntries((innerName) => {
+      if (seen.has(innerName) && dup === null) dup = innerName;
+      seen.add(innerName);
+      return true;
+    });
+    i = saved;
+    return okInner;
+  });
+  return okScan ? dup : null;
 }
 
 /** Fetch and gate the surface at a gitpp/state tip: one tarball call
@@ -3003,6 +3369,7 @@ async function fetchSurface(token, repo, tipSha) {
   const records = [];
   const recordEntries = [];
   const rejects = [];
+  const stateProposalFiles = [];
   let recordFileCount = 0;
   for (const e of entries) {
     if (SURFACE_JSON_PATH.test(e.name)) {
@@ -3024,10 +3391,43 @@ async function fetchSurface(token, repo, tipSha) {
         rejects,
         recordEntries,
       );
+    } else if (SURFACE_STATE_PROPOSAL_PATH.test(e.name)) {
+      // A proposal file ON the state branch (issue #14): never read
+      // as a proposal — proposals are read from proposed branches —
+      // but never silently ignored either: the landed Check names
+      // it (see renderSurfaceReport).
+      stateProposalFiles.push(displayPath(e.name));
     }
   }
-  const base = { records, recordEntries, rejects, recordFileCount };
+  // Duplicate-id resolution at intake (issue #11), as in
+  // fetchRecords: identical copies dedupe silently; one id with
+  // differing content rejects every copy by name.
+  const keptEntries = dedupeRecordEntries(recordEntries, rejects);
+  records.length = 0;
+  records.push(...keptEntries.map((e) => e.record));
+  recordEntries.length = 0;
+  recordEntries.push(...keptEntries);
+  const base = {
+    records,
+    recordEntries,
+    rejects,
+    recordFileCount,
+    stateProposalFiles,
+  };
   if (declText === null) return { declStatus: "absent", ...base };
+  // Duplicate declarations are refused before parsing (issue #15):
+  // JSON.parse would collapse them last-wins and the validator
+  // could never see the ambiguity.
+  const dupDeclKey = findDuplicateDeclarationKey(declText);
+  if (dupDeclKey !== null) {
+    return {
+      declStatus: "invalid",
+      declError:
+        `surface.json declares key "${dupDeclKey}" more than once — ` +
+        "duplicate declarations are refused; give the key one declaration",
+      ...base,
+    };
+  }
   let decl;
   try {
     decl = JSON.parse(declText);
@@ -3092,6 +3492,9 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
     }).catch(() => {});
   const inflightKey = `inflight-s:${repo}:${sha}`;
   const postedKey = `posted-s:${repo}:${sha}`;
+  const isStatePush =
+    args.ref === `refs/heads/${SURFACE_BRANCH}` ||
+    args.headBranch === SURFACE_BRANCH;
   let claimed = false;
   let token = null;
   let stage = "claim";
@@ -3103,6 +3506,30 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
     } catch {}
   };
   try {
+    if (isStatePush) {
+      // Discovery refresh BEFORE any duplicate-skip return (issue
+      // #13, second half of the F3 mechanism): a force-push restore
+      // lands on a commit that already has a posted Check, so its
+      // derivation skips below — and before this refresh, nothing
+      // ever corrected the discovery cache it leaves behind, so the
+      // next working-branch derivation derived the superseded tip
+      // the cache still held. The refresh is ref-verified and
+      // monotonic (see refreshSurfinfo/writeSurfinfo), costs one
+      // ref read, and the token is the module-cached one.
+      const instIdEarly = args.installationId ?? app.installation_id;
+      if (instIdEarly) {
+        token = await installationToken(app, instIdEarly).catch(() => null);
+        if (token) {
+          await refreshSurfinfo(
+            env,
+            token,
+            repo,
+            sha,
+            args.headCommitTime ?? null,
+          ).catch(() => {});
+        }
+      }
+    }
     if (await env.CREDS.get(postedKey)) {
       await log("skipped-duplicate", "posted marker exists for this commit");
       return;
@@ -3116,10 +3543,7 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
     const instId = args.installationId ?? app.installation_id;
     if (!instId) throw new Error("no installation id in payload or store");
     stage = "token";
-    token = await installationToken(app, instId);
-    const isStatePush =
-      args.ref === `refs/heads/${SURFACE_BRANCH}` ||
-      args.headBranch === SURFACE_BRANCH;
+    if (!token) token = await installationToken(app, instId);
     stage = "discover";
     let tipSha;
     let tipTime;
@@ -3130,19 +3554,11 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
       // itself rather than caching and rendering an unknown time.
       tipTime =
         args.headCommitTime ?? (await resolveTipTime(token, repo, tipSha));
-      // The push itself is the freshest discovery there is.
-      try {
-        await env.CREDS.put(
-          `surfinfo:${repo}`,
-          JSON.stringify({
-            has: true,
-            tipSha,
-            tipTime,
-            checkedAt: Date.now(),
-          }),
-          { expirationTtl: 3600 },
-        );
-      } catch {}
+      // No discovery write here: the cache was already refreshed —
+      // ref-verified and monotonic — before the claim checks above.
+      // The unconditional write this replaces was the regression
+      // vector in issue #13: a late-running job for an older push
+      // overwrote the newer tip a later push had already cached.
     } else {
       const info = await probeSurfaceTip(env, token, repo);
       if (!info.has) {
@@ -3260,6 +3676,7 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
         out: landedOut,
         fileRejects: surf.rejects,
         rawCount: surf.records.length,
+        stateProposalFiles: surf.stateProposalFiles ?? [],
       },
       proposals:
         mode === "preview" ? { gate: propGate, union } : null,

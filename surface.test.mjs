@@ -21,7 +21,7 @@ const slicePath = `${tmpdir()}/gitpp-surface-slice-${process.pid}.mjs`;
 writeFileSync(
   slicePath,
   src.slice(start, end) +
-    "\n;globalThis.__api = { maybeDerive, derive, renderReport, gateRecordFile, validateSurface, surfaceDeclares, applyDeclarationGate, pickWinnerId, renderSurfaceReport };\n",
+    "\n;globalThis.__api = { maybeDerive, derive, renderReport, gateRecordFile, validateSurface, surfaceDeclares, applyDeclarationGate, pickWinnerId, renderSurfaceReport, findDuplicateDeclarationKey, writeSurfinfo };\n",
 );
 await import(slicePath);
 const api = globalThis.__api;
@@ -766,6 +766,613 @@ await push(REPO2, "refs/heads/feature-y", CODE2);
     report.text.includes("1 key set · 0 conflict(s)") &&
       !report.text.includes("declared unset"),
     "S11: zero declared-unset patterns render just the keys-set count",
+  );
+}
+
+// ---- S12: duplicate record ids at intake (issue #11) ------------------------------
+// Same id + different content: EVERY copy is rejected by name, neither
+// derives, children orphan by name, and the counts stop claiming them.
+// Same id + identical content: the spec's collection-layer dedupe —
+// one copy derives, silently.
+const REPO5 = "acme/ferry5";
+const D1 = "d1".repeat(20);
+const D2 = "d2".repeat(20);
+const DUP_A = {
+  id: "dup-probe",
+  kind: "task",
+  parents: ["genesis"],
+  effects: { "task.claim.dup": "from-a" },
+};
+tarballs.set(
+  D1,
+  tarball({
+    "surface.json": J(DECL_V1),
+    "records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "deploy.hold": false },
+    }),
+    "records/dup-a.json": J(DUP_A),
+    "records/dup-b.json": J({
+      ...DUP_A,
+      effects: { "task.claim.dup": "from-b" },
+    }),
+    "records/child-dup.json": J({
+      id: "child-dup",
+      kind: "task",
+      parents: ["dup-probe"],
+      effects: { "oncall.primary": "child-value" },
+    }),
+  }),
+);
+tarballs.set(
+  D2,
+  tarball({
+    "surface.json": J(DECL_V1),
+    "records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "deploy.hold": false },
+    }),
+    "records/dup-a.json": J(DUP_A),
+    "records/dup-b.json": J(DUP_A),
+  }),
+);
+refTips.set(REPO5, { sha: D1, time: "2026-10-22T23:00:00Z" });
+at = posted.length;
+await push(REPO5, "refs/heads/gitpp/state", D1, "2026-10-22T23:00:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S12: surface Check posts on the duplicate-id tip");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("duplicate record id `dup-probe`") &&
+      text.includes("`records/dup-a.json`") &&
+      text.includes("`records/dup-b.json`"),
+    "S12: both files carrying the duplicated id are named",
+  );
+  ok(
+    !text.includes("from-a") && !text.includes("from-b"),
+    "S12: neither duplicate's value reaches the report",
+  );
+  ok(
+    text.includes("## Orphans (excluded from state)") &&
+      text.includes("- `child-dup`"),
+    "S12: the duplicated id's child orphans by name",
+  );
+  ok(
+    !text.includes("child-value"),
+    "S12: the orphan's value never reaches state",
+  );
+  ok(
+    text.includes("2 landed records") || text.includes("2 landed record(s)"),
+    "S12: the counts claim only the records that derived (genesis + the orphan)",
+  );
+}
+refTips.set(REPO5, { sha: D2, time: "2026-10-22T23:05:00Z" });
+at = posted.length;
+await push(REPO5, "refs/heads/gitpp/state", D2, "2026-10-22T23:05:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S12: surface Check posts on the identical-duplicate tip");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("`task.claim.dup` = from-a"),
+    "S12: identical duplicates dedupe — the record derives once",
+  );
+  ok(
+    !text.includes("duplicate record id"),
+    "S12: identical duplicates are silent (the spec's dedupe)",
+  );
+}
+
+// ---- S12b: duplicate ids on the Mapping A path (the intake is shared) -------------
+const REPO6 = "acme/ferry6";
+const A1 = "a9".repeat(20);
+tarballs.set(
+  A1,
+  tarball({
+    ".gitpp/project.json": J({ project: "dup-a-path" }),
+    ".gitpp/records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { project: "dup-a-path" },
+    }),
+    ".gitpp/records/dup-a.json": J({
+      id: "dup-probe",
+      kind: "task",
+      parents: ["genesis"],
+      effects: { "config.mode": "from-a" },
+    }),
+    ".gitpp/records/dup-b.json": J({
+      id: "dup-probe",
+      kind: "task",
+      parents: ["genesis"],
+      effects: { "config.mode": "from-b" },
+    }),
+    ".gitpp/records/child.json": J({
+      id: "child-dup",
+      kind: "task",
+      parents: ["dup-probe"],
+      effects: { "config.child": "x" },
+    }),
+  }),
+);
+at = posted.length;
+await push(REPO6, "refs/heads/main", A1);
+{
+  const sc = stateChecks(at);
+  eq(sc.length, 1, "S12b: Mapping A Check posts on the duplicate-id tree");
+  eq(surfaceChecks(at).length, 0, "S12b: no surface Check (no surface branch)");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("duplicate record id `dup-probe`") &&
+      text.includes("`.gitpp/records/dup-a.json`") &&
+      text.includes("`.gitpp/records/dup-b.json`"),
+    "S12b: the A path names both files carrying the duplicated id",
+  );
+  ok(
+    !text.includes("config.mode"),
+    "S12b: neither duplicate's key reaches A state",
+  );
+  ok(
+    text.includes("- `child-dup`"),
+    "S12b: the duplicated id's child orphans by name on the A path too",
+  );
+}
+
+// ---- S13: a same-id proposal discloses the wholesale replacement (issue #12) ------
+const REPO7 = "acme/ferry7";
+const E1 = "e1".repeat(20);
+const E2 = "e2".repeat(20);
+const E3 = "e3".repeat(20);
+tarballs.set(E1, tarball(LANDED_A));
+tarballs.set(
+  E2,
+  tarball({
+    "README.md": "# ferry\n",
+    ".gitpp/proposals/usurp.json": J({
+      id: "claim-dock-7",
+      kind: "override",
+      parents: ["genesis"],
+      effects: { "oncall.primary": "proposal-usurper" },
+      reason: "hostile takeover",
+    }),
+  }),
+);
+tarballs.set(
+  E3,
+  tarball({
+    "README.md": "# ferry\n",
+    ".gitpp/proposals/twin.json": LANDED_A["records/claim-dock-7.json"],
+  }),
+);
+refTips.set(REPO7, { sha: E1, time: "2026-10-22T17:00:00Z" });
+at = posted.length;
+await push(REPO7, "refs/heads/feature-usurp", E2);
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S13: preview Check posts on the usurper proposal");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes(
+      "proposal `claim-dock-7` replaces the landed record of the same id wholesale",
+    ) &&
+      text.includes("`task.claim.dock-7` = agent-dockhand"),
+    "S13: the verdict discloses the replacement and names the landed effect that would drop, with its value",
+  );
+  ok(
+    text.includes(
+      "proposal `claim-dock-7` sets `oncall.primary` = proposal-usurper — would win",
+    ),
+    "S13: the per-key verdict still prints for the key the proposal sets",
+  );
+  ok(
+    text.includes("`task.claim.*` — no keys set"),
+    "S13: the union state shows the dropped claim — the disclosure and the union agree",
+  );
+}
+at = posted.length;
+await push(REPO7, "refs/heads/feature-twin", E3);
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S13: preview Check posts on the identical-twin proposal");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes(
+      "proposal `claim-dock-7` — identical to the landed record of the same id; no change if landed again",
+    ) && !text.includes("replaces the landed record"),
+    "S13: an identical twin stays a plain no-change, no replacement language",
+  );
+}
+
+// ---- S14: a proposal file on gitpp/state itself is named, not silent (issue #14) ---
+const REPO8 = "acme/ferry8";
+const F1 = "f1".repeat(20);
+tarballs.set(
+  F1,
+  tarball({
+    ...LANDED_A,
+    ".gitpp/proposals/state-prop.json": J({
+      id: "state-prop",
+      kind: "task",
+      parents: ["genesis"],
+      effects: { "oncall.primary": "state-prop-value" },
+    }),
+  }),
+);
+refTips.set(REPO8, { sha: F1, time: "2026-10-22T17:00:00Z" });
+at = posted.length;
+await push(REPO8, "refs/heads/gitpp/state", F1, "2026-10-22T17:00:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S14: landed Check posts on the state tip carrying a proposal file");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("proposal file(s) found on `gitpp/state`") &&
+      text.includes("`.gitpp/proposals/state-prop.json`") &&
+      text.includes("these were ignored"),
+    "S14: the landed Check names the proposal file on the state branch and says it was ignored",
+  );
+  ok(
+    text.includes("`oncall.primary` = rota-lead") &&
+      !text.includes("state-prop-value"),
+    "S14: the state-branch proposal does not derive",
+  );
+  ok(
+    !text.includes("## In flight"),
+    "S14: no preview section on a landed Check",
+  );
+}
+
+// ---- S15: duplicate keys in surface.json are refused by name (issue #15) -----------
+{
+  const dupDeclText =
+    `{"version":1,"name":"ferry-ops","preview":"full","keys":{` +
+    `"task.claim.*":{"description":"claims"},` +
+    `"oncall.primary":{"description":"DUP-FIRST-DESCRIPTION"},` +
+    `"deploy.hold":{"description":"hold"},` +
+    `"oncall.primary":{"description":"DUP-SECOND-DESCRIPTION"}}}`;
+  eq(
+    api.findDuplicateDeclarationKey(dupDeclText),
+    "oncall.primary",
+    "S15: the raw-text scan names the duplicated declaration key",
+  );
+  eq(
+    api.findDuplicateDeclarationKey(
+      dupDeclText.replace(
+        '"oncall.primary":{"description":"DUP-SECOND-DESCRIPTION"}',
+        '"oncall.\\u0070rimary":{"description":"DUP-SECOND-DESCRIPTION"}',
+      ),
+    ),
+    "oncall.primary",
+    "S15: an escaped spelling of the same name is still a duplicate",
+  );
+  eq(
+    api.findDuplicateDeclarationKey(
+      `{"version":1,"name":"x","keys":{"a":{"description":"decoy \\"keys\\": {\\"x\\":1,\\"x\\":2}"}}}`,
+    ),
+    null,
+    "S15: lookalike text inside a description string is not a duplicate",
+  );
+  eq(
+    api.findDuplicateDeclarationKey(J(DECL_V1)),
+    null,
+    "S15: a valid declaration has no duplicates",
+  );
+  const REPO9 = "acme/ferry9";
+  const F2 = "f2".repeat(20);
+  tarballs.set(
+    F2,
+    tarball({ ...LANDED_A, "surface.json": dupDeclText }),
+  );
+  refTips.set(REPO9, { sha: F2, time: "2026-10-22T17:00:00Z" });
+  at = posted.length;
+  await push(REPO9, "refs/heads/gitpp/state", F2, "2026-10-22T17:00:00Z");
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S15: exactly one surface Check on the duplicated declaration");
+  eq(
+    sc[0]?.conclusion,
+    "failure",
+    "S15: a duplicated declaration earns the failure Check, never a silent derivation",
+  );
+  ok(
+    (sc[0]?.output.text ?? "").includes(
+      'declares key "oncall.primary" more than once',
+    ),
+    "S15: the failure Check names the duplicated key",
+  );
+}
+
+// ---- S16: key patterns are length-bounded (adversarial F8) --------------------------
+{
+  const tooLong = api.validateSurface({
+    version: 1,
+    name: "x",
+    keys: { ["k".repeat(201)]: { description: "d" } },
+  });
+  ok(
+    !!tooLong.error && tooLong.error.includes("limited to 200 characters"),
+    "S16: a 201-char pattern is refused, naming the 200-char rule",
+  );
+  ok(
+    (tooLong.error ?? "").length < 200,
+    "S16: the refusal does not print the giant pattern back in full",
+  );
+  ok(
+    !!api.validateSurface({
+      version: 1,
+      name: "x",
+      keys: { ["k".repeat(200)]: { description: "d" } },
+    }).surface,
+    "S16: a 200-char pattern is still valid",
+  );
+}
+
+// ---- S17: exact + family declarations render one line per key (adversarial F7) -----
+{
+  const surface = api.validateSurface({
+    version: 1,
+    name: "one-key",
+    preview: "full",
+    keys: {
+      "oncall.primary": { description: "EXACT-DESC" },
+      "oncall.*": { description: "FAMILY-DESC" },
+    },
+  }).surface;
+  const records = [
+    {
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "oncall.primary": "rota-lead", "oncall.backup": "second" },
+    },
+  ];
+  const gate = {
+    kept: records,
+    fullyRejected: [],
+    partialRejects: [],
+    retired: [],
+  };
+  const report = api.renderSurfaceReport({
+    surface,
+    mode: "landed",
+    sha: S("1"),
+    tipSha: S("2"),
+    tipTime: "2026-10-22T22:00:00Z",
+    landed: {
+      gate,
+      out: api.derive(records),
+      fileRejects: [],
+      rawCount: records.length,
+    },
+    proposals: null,
+    vanished: null,
+  });
+  const primaryLines = report.text
+    .split("\n")
+    .filter((l) => l.startsWith("- `oncall.primary` ="));
+  eq(
+    primaryLines.length,
+    1,
+    "S17: a key under both an exact and a family declaration renders exactly once",
+  );
+  ok(
+    primaryLines[0]?.includes("EXACT-DESC") &&
+      !primaryLines[0]?.includes("FAMILY-DESC"),
+    "S17: the single line carries the exact declaration's description",
+  );
+  ok(
+    report.text.includes("- `oncall.backup` = second") &&
+      report.text.includes("FAMILY-DESC"),
+    "S17: a family-only key still renders under the family description",
+  );
+  const onlyExact = api.renderSurfaceReport({
+    surface,
+    mode: "landed",
+    sha: S("1"),
+    tipSha: S("2"),
+    tipTime: "2026-10-22T22:00:00Z",
+    landed: {
+      gate,
+      out: api.derive([records[0]]),
+      fileRejects: [],
+      rawCount: 1,
+    },
+    proposals: null,
+    vanished: null,
+  });
+  ok(
+    !onlyExact.text.includes("`oncall.*` — no keys set"),
+    "S17: a family whose only matches are exact-governed prints no 'no keys set' line",
+  );
+}
+
+// ---- S18: the discovery cache cannot regress to a superseded tip (issue #13) ------
+// The F3 sequence: two rapid state pushes, a force-push restore to the
+// first tip, then a working-branch push. The restore's derivation SKIPS
+// (its commit already has a Check) — the refresh must still correct
+// the cache, and the working Check must derive the restored tip.
+const REPO10 = "acme/ferry10";
+const G1 = "0a".repeat(20);
+const G2 = "0b".repeat(20);
+const GW = "0c".repeat(20);
+tarballs.set(
+  G1,
+  tarball({
+    "surface.json": J(DECL_V1),
+    "records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "deploy.hold": false },
+    }),
+  }),
+);
+tarballs.set(
+  G2,
+  tarball({
+    "surface.json": J(DECL_V1),
+    "records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "deploy.hold": false },
+    }),
+    "records/oncall-rota.json": J({
+      id: "oncall-rota",
+      kind: "task",
+      parents: ["genesis"],
+      effects: { "oncall.primary": "rota-lead" },
+    }),
+  }),
+);
+tarballs.set(GW, tarball({ "README.md": "# ferry\n" }));
+const surfinfoTip = () =>
+  JSON.parse(env.CREDS.m.get(`surfinfo:${REPO10}`) ?? "{}").tipSha;
+refTips.set(REPO10, { sha: G1, time: "2026-10-23T00:00:00Z" });
+await push(REPO10, "refs/heads/gitpp/state", G1, "2026-10-23T00:00:00Z");
+eq(surfinfoTip(), G1, "S18: the first state push caches its own tip");
+refTips.set(REPO10, { sha: G2, time: "2026-10-23T00:01:00Z" });
+await push(REPO10, "refs/heads/gitpp/state", G2, "2026-10-23T00:01:00Z");
+eq(surfinfoTip(), G2, "S18: the second state push advances the cache");
+refTips.set(REPO10, { sha: G1, time: "2026-10-23T00:00:00Z" });
+at = posted.length;
+await push(REPO10, "refs/heads/gitpp/state", G1, "2026-10-23T00:02:00Z");
+eq(
+  surfaceChecks(at).length,
+  0,
+  "S18: the restore push's derivation skips (its commit already has a Check)",
+);
+eq(
+  surfinfoTip(),
+  G1,
+  "S18: the skipping restore job still refreshes the cache back to the restored tip",
+);
+at = posted.length;
+await push(REPO10, "refs/heads/main", GW);
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S18: the working-branch push gets its as-landed Check");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("`gitpp/state` at `0a0a0a0`"),
+    "S18: the working Check derives the restored tip, not the superseded one",
+  );
+  ok(
+    !text.includes("0b0b0b0") && text.includes("`oncall.primary` — unset"),
+    "S18: none of the superseded tip's state leaks into the working Check",
+  );
+}
+{
+  // The write guard itself: an older observation never overwrites a
+  // newer one, whatever order the writes land in.
+  const GREPO = "acme/guard";
+  await api.writeSurfinfo(
+    env,
+    GREPO,
+    { has: true, tipSha: G2, tipTime: null },
+    5000,
+  );
+  await api.writeSurfinfo(
+    env,
+    GREPO,
+    { has: true, tipSha: G1, tipTime: null },
+    4000,
+  );
+  eq(
+    JSON.parse(env.CREDS.m.get(`surfinfo:${GREPO}`)).tipSha,
+    G2,
+    "S18: an out-of-order (older-observation) write is refused",
+  );
+  await api.writeSurfinfo(
+    env,
+    GREPO,
+    { has: true, tipSha: G1, tipTime: null },
+    6000,
+  );
+  eq(
+    JSON.parse(env.CREDS.m.get(`surfinfo:${GREPO}`)).tipSha,
+    G1,
+    "S18: a fresher observation still lands",
+  );
+}
+
+// ---- S19: one deeply-nested value is refused by name, alone (adversarial F6) -------
+{
+  const deepText =
+    `{"id":"deep-1","kind":"task","parents":["genesis"],"effects":{"release.freeze":` +
+    `{"a":`.repeat(10000) +
+    "1" +
+    "}".repeat(10000) +
+    `}}`;
+  const recs = [];
+  const rej = [];
+  api.gateRecordFile(deepText, "records/deep-1.json", recs, rej);
+  eq(recs.length, 0, "S19: the 10,000-deep record does not pass the gate");
+  ok(
+    rej.length === 1 &&
+      rej[0].file === "records/deep-1.json" &&
+      rej[0].error.includes("value-depth limit"),
+    "S19: the gate names the file and the value-depth rule",
+  );
+  const shallowText =
+    `{"id":"ok-1","kind":"task","parents":[],"effects":{"release.freeze":` +
+    `{"a":`.repeat(50) +
+    "1" +
+    "}".repeat(50) +
+    `}}`;
+  const recs2 = [];
+  const rej2 = [];
+  api.gateRecordFile(shallowText, "records/ok-1.json", recs2, rej2);
+  eq(
+    recs2.length,
+    1,
+    "S19: a 50-deep value is ordinary and passes (the gate is shared, so the A path gains this too)",
+  );
+  const REPO11 = "acme/ferry11";
+  const DP = "0d".repeat(20);
+  tarballs.set(
+    DP,
+    tarball({
+      "surface.json": J(DECL_V1),
+      "records/genesis.json": J({
+        id: "genesis",
+        kind: "witness",
+        parents: [],
+        effects: { "deploy.hold": false },
+      }),
+      "records/deep-1.json": deepText,
+      "records/oncall.json": J({
+        id: "oncall-rota",
+        kind: "task",
+        parents: ["genesis"],
+        effects: { "oncall.primary": "rota-lead" },
+      }),
+    }),
+  );
+  refTips.set(REPO11, { sha: DP, time: "2026-10-23T01:00:00Z" });
+  at = posted.length;
+  await push(REPO11, "refs/heads/gitpp/state", DP, "2026-10-23T01:00:00Z");
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S19: the surface Check still posts with a deep record in the set");
+  eq(
+    sc[0]?.conclusion,
+    "neutral",
+    "S19: one deep record no longer fails the whole derivation",
+  );
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("`records/deep-1.json`") &&
+      text.includes("value-depth limit"),
+    "S19: the Check names the deep file and the rule",
+  );
+  ok(
+    text.includes("`oncall.primary` = rota-lead"),
+    "S19: everything else on the surface still derives",
   );
 }
 
