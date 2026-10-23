@@ -84,6 +84,23 @@ verified deliveries, newest last.
   live on the demo repository: push → Check showing
   `config.timeout = 45`, winner `override-1`, losers
   `task-a`/`task-b`/`task-d` preserved.
+- **Declared surfaces (Mapping B), built and deployed 2026-10-22:**
+  a repository can declare a coordination surface — `surface.json`
+  plus records on an orphan branch, `gitpp/state` — and the Worker
+  derives it into a second, independent Check named
+  `git.pp surface`: on the state tip as landed, and on
+  working-branch commits as the state a merge would join, with any
+  proposed records (`.gitpp/proposals/*.json`) derived separately
+  and labelled as proposed, never landed. Same permissions, same
+  advisory doctrine; the App still writes nothing. Specified in
+  the Mapping B design; proven by the extraction harness in
+  `surface.test.mjs` (48 assertions over synthetic webhook
+  deliveries: declaration gate, retired keys, proposal verdicts,
+  history integrity, the proposals-only knob). **Not yet proven
+  live:** the dogfood repository `patchwork-quilt/gitpp-dogfood-b1`
+  is scaffolded with a declared surface, but the App is not
+  installed on it yet — that step, and the first live surface
+  Check, belong to the acceptance run, not this status line.
 - The App's credentials, held in the Worker's `CREDS` KV store —
   never in this repo, never rendered in a page or a log.
 
@@ -136,6 +153,46 @@ agent / human ──push records──▶ GitHub ──webhook (HMAC-signed)─�
 Worker: verify signature → record delivery → 202        ✓ live today
         └─▶ fetch records → fold → post Check            ✓ live today
 ```
+
+## Declared surfaces (Mapping B)
+
+Mapping A is for repositories that *are* records. Most
+repositories are code — but their humans and agents still collide
+over a handful of coordination keys: who has claimed this task,
+whether releases are frozen, who holds the pager, whether deploys
+are held. A **declared surface** gives those keys a home without
+reading the code:
+
+- The team declares the keys in `surface.json` at the root of an
+  orphan branch, `gitpp/state` — exact key names or trailing `.*`
+  families (`task.claim.*`), each with a required human
+  description. Records live beside it in `records/`, written by
+  ordinary git under the team's own credentials; the App never
+  writes anything (Tier 1 — the permission set above is unchanged).
+- A push to `gitpp/state` derives the landed records onto the tip
+  as a Check named **`git.pp surface`**. A push to any other branch
+  derives the surface as it stands onto that commit (the
+  declaration's `preview` knob can restrict this to pushes that
+  actually propose), so a reviewer sees the state their merge
+  would join. A push whose tree carries `.gitpp/proposals/*.json`
+  gets a **preview**: the landed state, then the proposals'
+  verdicts — *would win*, *would lose to …*, *no change* — from a
+  separate union derivation, labelled proposed and never folded
+  into the landed state.
+- Only declared keys derive. A record setting undeclared keys is
+  rejected **by name** in the Check; a key removed from the
+  declaration lists its records under **Retired** — preserved on
+  the branch, revived by re-declaring — never silently dropped.
+  And because a force-push can make records vanish without any
+  record saying so, each derivation diffs the branch's record-id
+  set against the last derived one and names any vanished ids in a
+  **History integrity** line.
+- Every surface Check opens with its scope sentence: it derives
+  the declared surface only, did not read or analyse the
+  repository's code, and says nothing about whether the code
+  merges. A repository can run both mappings at once — `.gitpp/
+  records` answers as `git.pp state`, the surface as
+  `git.pp surface`, each from its own inputs.
 
 ### Endpoints, and how each behaves
 

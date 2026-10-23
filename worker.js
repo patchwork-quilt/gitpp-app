@@ -368,6 +368,7 @@ async function events(env) {
   return Response.json(out.slice(-20));
 }
 
+/*TEST-EXTRACT:core*/
 // ============================================================================
 // VENDORED FOLD ENGINE — DO NOT EDIT IN THIS REPO.
 //
@@ -1770,12 +1771,16 @@ function tarField(bytes, off, len) {
  * Handles the 155-byte prefix field, GNU longname ('L') and pax ('x')
  * path overrides — GitHub/codeload tarballs use all three. A base-256
  * (binary) size field is refused with a clear error instead of being
- * misread as octal, which would desync the whole walk. */
-function parseTar(bytes) {
+ * misread as octal, which would desync the whole walk. The optional
+ * `keep` predicate selects which regular files get decoded; the
+ * default keeps everything under .gitpp/ (Mapping A). The surface
+ * path (Mapping B) passes its own predicate for the gitpp/state
+ * branch tarball, whose files live at the branch root. */
+function parseTar(bytes, keep) {
   const entries = [];
   let offset = 0;
   let pendingName = null;
-  const wanted = (name) => /(^|\/)\.gitpp\//.test(name);
+  const wanted = keep ?? ((name) => /(^|\/)\.gitpp\//.test(name));
   while (offset + 512 <= bytes.length) {
     const name = tarField(bytes, offset, 100);
     if (!name) break;
@@ -1833,6 +1838,7 @@ async function gunzip(bytes) {
 
 const RECORD_PATH = /(^|\/)\.gitpp\/records\/[^/]+\.json$/;
 const PROJECT_PATH = /(^|\/)\.gitpp\/project\.json$/;
+const PROPOSAL_PATH = /(^|\/)\.gitpp\/proposals\/[^/]+\.json$/;
 
 // ---- Input gate ------------------------------------------------------------
 //
@@ -1917,6 +1923,41 @@ function displayPath(name) {
   return i >= 0 ? name.slice(i + 1) : name;
 }
 
+/** Parse and gate one record-bearing file into the given sinks. A
+ * file that does not parse becomes one reject naming the file; each
+ * record inside is gated individually by gateRecord. Shared by
+ * .gitpp/records/ (Mapping A), .gitpp/proposals/ (Mapping B
+ * previews) and the surface branch's records/ (Mapping B landed) —
+ * one gating discipline for every record this app reads. */
+function gateRecordFile(text, file, records, rejects, entries) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    rejects.push({
+      file,
+      error: truncErr(`JSON parse failed: ${err.message}`),
+    });
+    return;
+  }
+  const items = Array.isArray(parsed)
+    ? parsed.map((v, i) => [v, i])
+    : [[parsed, undefined]];
+  for (const [item, index] of items) {
+    const gated = gateRecord(item, file, index);
+    if (gated.reject) {
+      rejects.push(gated.reject);
+    } else {
+      records.push(gated.record);
+      if (entries) entries.push({ record: gated.record, file });
+      if (records.length > MAX_RECORDS) {
+        throw new TooLargeError(`more than ${MAX_RECORDS} parsed records`);
+      }
+    }
+  }
+}
+
 async function fetchRecords(token, repo, sha) {
   const res = await fetch(
     `https://api.github.com/repos/${repo}/tarball/${sha}`,
@@ -1946,41 +1987,37 @@ async function fetchRecords(token, repo, sha) {
   const entries = parseTar(tar);
   const records = [];
   const rejects = [];
+  const proposals = [];
+  const proposalRejects = [];
+  const proposalEntries = [];
   let project = null;
   let recordFileCount = 0;
+  let proposalFileCount = 0;
   for (const e of entries) {
     if (RECORD_PATH.test(e.name)) {
       recordFileCount++;
       if (recordFileCount > MAX_RECORD_FILES) {
         throw new TooLargeError(`more than ${MAX_RECORD_FILES} record files`);
       }
-      const file = displayPath(e.name);
-      let text = e.text;
-      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-      let parsed;
-      try {
-        parsed = JSON.parse(text);
-      } catch (err) {
-        rejects.push({
-          file,
-          error: truncErr(`JSON parse failed: ${err.message}`),
-        });
-        continue;
+      gateRecordFile(e.text, displayPath(e.name), records, rejects);
+    } else if (PROPOSAL_PATH.test(e.name)) {
+      // Mapping B proposals ride in the same tarball Mapping A already
+      // fetched — collecting them costs no extra call. The Mapping A
+      // path ignores them entirely; the surface path reads them via
+      // the shared intake (see deriveSurfaceAndPost).
+      proposalFileCount++;
+      if (proposalFileCount > MAX_RECORD_FILES) {
+        throw new TooLargeError(
+          `more than ${MAX_RECORD_FILES} proposal files`,
+        );
       }
-      const items = Array.isArray(parsed)
-        ? parsed.map((v, i) => [v, i])
-        : [[parsed, undefined]];
-      for (const [item, index] of items) {
-        const gated = gateRecord(item, file, index);
-        if (gated.reject) {
-          rejects.push(gated.reject);
-        } else {
-          records.push(gated.record);
-          if (records.length > MAX_RECORDS) {
-            throw new TooLargeError(`more than ${MAX_RECORDS} parsed records`);
-          }
-        }
-      }
+      gateRecordFile(
+        e.text,
+        displayPath(e.name),
+        proposals,
+        proposalRejects,
+        proposalEntries,
+      );
     } else if (PROJECT_PATH.test(e.name)) {
       try {
         let text = e.text;
@@ -1991,7 +2028,16 @@ async function fetchRecords(token, repo, sha) {
       }
     }
   }
-  return { records, rejects, project, recordFileCount };
+  return {
+    records,
+    rejects,
+    project,
+    recordFileCount,
+    proposals,
+    proposalRejects,
+    proposalEntries,
+    proposalFileCount,
+  };
 }
 
 // ---- The loop ---------------------------------------------------------------
@@ -2015,13 +2061,14 @@ async function appendRing(env, entry) {
   } catch {}
 }
 
-/** The id of an existing "git.pp state" check run on this commit, or
- * null. This is the idempotence backstop: KV claims can race, but a
- * run GitHub already holds cannot be un-held — if one exists, never
- * post a second. */
-async function existingCheckId(token, repo, sha) {
+/** The id of an existing check run of the given name on this commit,
+ * or null. This is the idempotence backstop: KV claims can race, but
+ * a run GitHub already holds cannot be un-held — if one exists, never
+ * post a second. The name defaults to Mapping A's "git.pp state";
+ * the surface path passes "git.pp surface". */
+async function existingCheckId(token, repo, sha, name = "git.pp state") {
   const res = await fetch(
-    `https://api.github.com/repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent("git.pp state")}`,
+    `https://api.github.com/repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}`,
     {
       headers: {
         authorization: `Bearer ${token}`,
@@ -2039,7 +2086,12 @@ async function existingCheckId(token, repo, sha) {
   return null;
 }
 
-async function postCheckRun(token, repo, sha, { title, summary, text, conclusion }) {
+async function postCheckRun(
+  token,
+  repo,
+  sha,
+  { title, summary, text, conclusion, name = "git.pp state" },
+) {
   const res = await fetch(`https://api.github.com/repos/${repo}/check-runs`, {
     method: "POST",
     headers: {
@@ -2050,7 +2102,7 @@ async function postCheckRun(token, repo, sha, { title, summary, text, conclusion
       "user-agent": "gitpp-app-receiver",
     },
     body: JSON.stringify({
-      name: "git.pp state",
+      name,
       head_sha: sha,
       status: "completed",
       conclusion,
@@ -2081,7 +2133,7 @@ async function postFailureCheck(token, repo, sha, failure) {
   });
 }
 
-async function deriveAndPost(env, app, { repo, sha, installationId }) {
+async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
   const log = (action, detail) =>
     appendRing(env, {
       t: new Date().toISOString(),
@@ -2121,8 +2173,12 @@ async function deriveAndPost(env, app, { repo, sha, installationId }) {
     stage = "token";
     token = await installationToken(app, instId);
     stage = "fetch";
-    const { records, rejects, project, recordFileCount } =
-      await fetchRecords(token, repo, sha);
+    const fetched = await fetchRecords(token, repo, sha);
+    const { records, rejects, project, recordFileCount } = fetched;
+    // The tarball is already paid for: share the whole intake with
+    // the surface path (Mapping B), which needs the proposals from
+    // this same tree and must not fetch it a second time.
+    if (shared) shared.intake = fetched;
     if (records.length === 0 && rejects.length === 0) {
       // No records surface (or only empty ones): silence, by design.
       await releaseClaim();
@@ -2198,16 +2254,1049 @@ async function deriveAndPost(env, app, { repo, sha, installationId }) {
   }
 }
 
+// ---- Mapping B: declared surfaces -------------------------------------------
+//
+// A declared state surface for ordinary repositories (design:
+// mapping-b-design/DESIGN.md). The team names a small set of
+// coordination keys in surface.json at the root of an orphan branch,
+// gitpp/state, and keeps records beside it in records/. This Worker
+// derives that surface and posts it as a Check named "git.pp surface"
+// — on the state branch tip as landed, and on working-branch commits
+// as the state a merge would join, plus the effect of any proposed
+// records (.gitpp/proposals/*.json) in that tree, derived separately
+// and labelled as proposed, never landed.
+//
+// Tier 1 only: the App's permissions are unchanged and it writes
+// nothing anywhere. Records reach gitpp/state by ordinary git under
+// the team's own credentials.
+//
+// KV, beside the app record and the Mapping A keys:
+//   surfinfo:<repo>          discovery cache {has, tipSha, tipTime,
+//                            checkedAt} — probed at most hourly, so
+//                            non-surface repos cost no per-push call.
+//   surfdecl:<repo>:<tipSha> the declaration as fetched at that tip.
+//   surfmanifest:<repo>      {ids, patterns, tipSha, at} from the
+//                            last posted surface derivation — the
+//                            history-integrity baseline (§5.2 of the
+//                            design). Ids and patterns only; no state
+//                            digest is pinned.
+//   inflight-s:/posted-s:    the per-commit claim discipline, scoped
+//                            to the surface Check so one commit can
+//                            hold a "git.pp state" and a "git.pp
+//                            surface" run side by side.
+//
+// Interaction with Mapping A (the choice, stated): a repo whose
+// pushed commit carries .gitpp/records keeps exactly today's
+// Mapping A behaviour, untouched. The surface path is an independent
+// second derivation over independent inputs; neither reads the
+// other's records.
+
+/*TEST-EXTRACT:surface*/
+
+const SURFACE_BRANCH = "gitpp/state";
+const SURFACE_CHECK_NAME = "git.pp surface";
+const SURFACE_FILE = /^[^/]+\/(surface\.json|records\/[^/]+\.json)$/;
+const SURFACE_JSON_PATH = /^[^/]+\/surface\.json$/;
+const SURFACE_RECORD_PATH = /^[^/]+\/records\/[^/]+\.json$/;
+const SURFACE_PROBE_TTL_MS = 3600 * 1000;
+
+const SURFACE_SCOPE =
+  "This Check derives the declared coordination surface only — the " +
+  "keys named in `surface.json` on `gitpp/state`. It did not read or " +
+  "analyse this repository's code, and it says nothing about whether " +
+  "the code merges cleanly.";
+
+const SURFACE_QUALIFICATIONS =
+  QUALIFICATIONS +
+  " The surface is what its records say, written by the people and " +
+  "agents named in them.";
+
+/** Validate a parsed surface.json against the v1 schema (design
+ * §2.2): version 1; a non-empty name; preview "full" (default) or
+ * "proposals-only"; a non-empty keys object whose names are exact
+ * keys or single trailing .* families, each with a required non-empty
+ * description (the description is the legibility surface). Returns
+ * { surface } — patterns in declaration order, {pattern, prefix,
+ * description} with prefix null for exact keys and the dotted prefix
+ * ("task.claim.") for families — or { error }. */
+function validateSurface(decl) {
+  const bad = (error) => ({ error });
+  if (!isPlainObject(decl)) return bad("surface.json is not a JSON object");
+  if (decl.version !== 1) return bad("surface.json version must be 1");
+  if (typeof decl.name !== "string" || decl.name.length === 0) {
+    return bad("surface.json name must be a non-empty string");
+  }
+  const preview = decl.preview ?? "full";
+  if (preview !== "full" && preview !== "proposals-only") {
+    return bad('surface.json preview must be "full" or "proposals-only"');
+  }
+  if (!isPlainObject(decl.keys) || Object.keys(decl.keys).length === 0) {
+    return bad("surface.json keys must be a non-empty object");
+  }
+  const patterns = [];
+  for (const [pattern, spec] of Object.entries(decl.keys)) {
+    if (pattern.length === 0) {
+      return bad("surface.json declares an empty key name");
+    }
+    let prefix = null;
+    if (pattern.includes("*")) {
+      if (
+        !pattern.endsWith(".*") ||
+        pattern.indexOf("*") !== pattern.length - 1
+      ) {
+        return bad(
+          `key pattern "${pattern}" is not an exact name or a single trailing .* family`,
+        );
+      }
+      prefix = pattern.slice(0, -1);
+    }
+    if (
+      !isPlainObject(spec) ||
+      typeof spec.description !== "string" ||
+      spec.description.length === 0
+    ) {
+      return bad(
+        `key "${pattern}" must declare a non-empty description — the description is what a reader of the Check sees`,
+      );
+    }
+    patterns.push({ pattern, prefix, description: spec.description });
+  }
+  return { surface: { version: 1, name: decl.name, preview, patterns } };
+}
+
+/** The declaration entry governing one concrete key, or null. An
+ * exact name beats a family; among families the longest prefix wins,
+ * so nested families resolve deterministically. */
+function surfaceDeclares(surface, key) {
+  let best = null;
+  for (const p of surface.patterns) {
+    if (p.prefix === null) {
+      if (p.pattern === key) return p;
+    } else if (key.startsWith(p.prefix)) {
+      if (!best || p.prefix.length > best.prefix.length) best = p;
+    }
+  }
+  return best;
+}
+
+/** Whether a key was declared by a previous declaration's patterns
+ * (the retired test, design §2.3). Patterns arrive either normalized
+ * ({pattern, prefix}) or as bare strings (the manifest stores them
+ * normalized; bare strings are accepted for robustness). */
+function previouslyDeclared(prevPatterns, key) {
+  for (const p of prevPatterns ?? []) {
+    const pattern = typeof p === "string" ? p : p.pattern;
+    const prefix =
+      typeof p === "string"
+        ? p.endsWith(".*")
+          ? p.slice(0, -1)
+          : null
+        : p.prefix;
+    if (prefix === null ? pattern === key : key.startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Apply the declaration to gated record entries (design §2.3).
+ * entries: [{record, file}] (file may be null when unknown).
+ * Returns:
+ *   kept          records that derive, effects filtered to declared
+ *                 keys; records with no effect keys are structural
+ *                 anchors (they carry ancestry, set nothing) and are
+ *                 always kept — a record can only be rejected for
+ *                 keys it actually sets;
+ *   fullyRejected [{id, file, keys}] records whose effect keys are
+ *                 all undeclared (and none merely retired): rejected
+ *                 input, named, never silent;
+ *   partialRejects [{id, file, keys}] undeclared keys stripped from
+ *                 records that still derived their declared keys;
+ *   retired       [{id, file, keys, partial}] keys that a previous
+ *                 declaration covered and this one does not. A record
+ *                 whose only keys retired did not derive; a record
+ *                 that also sets declared keys derived without them. */
+function applyDeclarationGate(surface, entries, prevPatterns) {
+  const kept = [];
+  const fullyRejected = [];
+  const partialRejects = [];
+  const retired = [];
+  for (const { record, file } of entries) {
+    const eff = effectsOf(record);
+    const keys = Object.keys(eff);
+    if (keys.length === 0) {
+      kept.push(record);
+      continue;
+    }
+    const declared = {};
+    const undeclared = [];
+    const retiredKeys = [];
+    for (const k of keys) {
+      if (surfaceDeclares(surface, k)) setOwn(declared, k, eff[k]);
+      else if (previouslyDeclared(prevPatterns, k)) retiredKeys.push(k);
+      else undeclared.push(k);
+    }
+    const id = String(record.id);
+    if (Object.keys(declared).length > 0) {
+      kept.push({ ...record, effects: declared });
+      if (undeclared.length > 0) {
+        partialRejects.push({ id, file, keys: undeclared });
+      }
+      if (retiredKeys.length > 0) {
+        retired.push({ id, file, keys: retiredKeys, partial: true });
+      }
+    } else if (undeclared.length > 0) {
+      fullyRejected.push({
+        id,
+        file,
+        keys: [...undeclared, ...retiredKeys],
+      });
+    } else {
+      retired.push({ id, file, keys: retiredKeys, partial: false });
+    }
+  }
+  return { kept, fullyRejected, partialRejects, retired };
+}
+
+/** Setter map for a record set: key → [record ids], orphans excluded
+ * (an orphan's claims do not stand, so it sets nothing). */
+function settersOf(records, orphanIds) {
+  const orphanSet = new Set(orphanIds);
+  const m = new Map();
+  for (const r of records) {
+    const id = String(r.id);
+    if (orphanSet.has(id)) continue;
+    for ( const k of Object.keys(effectsOf(r))) {
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(id);
+    }
+  }
+  return m;
+}
+
+/** The record the fold picks for one key among its setters, computed
+ * from the parents graph the way explainConflict mirrors the engine:
+ * best kind rank, then maximal (not an ancestor of a rival in the
+ * pool), then the tie-break tuple (most intent ancestors, fewest
+ * witness ancestors, smallest id). The harness cross-checks this
+ * against derive()'s own conflict winners. */
+function pickWinnerId(setterIds, byId) {
+  const ancCache = new Map();
+  let best = Infinity;
+  for (const id of setterIds) best = Math.min(best, rankOf(byId.get(id)));
+  const pool = setterIds.filter((id) => rankOf(byId.get(id)) === best);
+  const maximal = pool.filter(
+    (id) =>
+      !pool.some(
+        (other) =>
+          other !== id &&
+          tieBreakCounts(other, byId, ancCache).anc.has(id),
+      ),
+  );
+  if (maximal.length === 1) return maximal[0];
+  return [...maximal].sort((a, b) => {
+    const ai = tieBreakCounts(a, byId, ancCache);
+    const bi = tieBreakCounts(b, byId, ancCache);
+    if (ai.intent !== bi.intent) return bi.intent - ai.intent;
+    if (ai.wit !== bi.wit) return ai.wit - bi.wit;
+    return cmpCodePoints(a, b);
+  })[0];
+}
+
+/** One state line per declared key (design §4.3): exact keys always
+ * appear (value and winner, or "unset"); family patterns appear once
+ * per concrete key set, or once as "no keys set". Every line carries
+ * the declaration's description — that text is the legibility
+ * surface. Winners come from the derivation's conflicts where the
+ * key was contested, else from pickWinnerId over the applied
+ * setters. */
+function surfaceStateLines(surface, out, records) {
+  const byId = new Map(records.map((r) => [String(r.id), r]));
+  const setters = settersOf(records, out.orphans);
+  const conflictByKey = new Map(out.conflicts.map((c) => [c.key, c]));
+  const winnerOf = (key) => {
+    const ids = setters.get(key) ?? [];
+    if (ids.length === 0) return null;
+    const wid = conflictByKey.get(key)?.winner ?? pickWinnerId(ids, byId);
+    return { id: wid, rec: byId.get(wid) };
+  };
+  const winText = (w) =>
+    `winner \`${w.id}\` (${kindOf(w.rec)}` +
+    (w.rec?.reason ? `, reason: "${w.rec.reason}"` : "") +
+    ")";
+  const lines = [];
+  for (const p of surface.patterns) {
+    if (p.prefix !== null) continue;
+    const w = winnerOf(p.pattern);
+    lines.push(
+      w
+        ? `- \`${p.pattern}\` = ${fmtValue(out.state[p.pattern])} — ${winText(w)} — ${p.description}`
+        : `- \`${p.pattern}\` — unset — ${p.description}`,
+    );
+  }
+  for (const p of surface.patterns) {
+    if (p.prefix === null) continue;
+    const concrete = Object.keys(out.state)
+      .filter((k) => k.startsWith(p.prefix))
+      .sort(cmpCodePoints);
+    if (concrete.length === 0) {
+      lines.push(`- \`${p.pattern}\` — no keys set — ${p.description}`);
+    }
+    for (const k of concrete) {
+      const w = winnerOf(k);
+      lines.push(
+        `- \`${k}\` = ${fmtValue(out.state[k])} — ${winText(w)} — ${p.description}`,
+      );
+    }
+  }
+  return lines;
+}
+
+/** Per-proposal verdicts for a preview (design §4.3 row 5), computed
+ * from the union derivation: for every declared key a kept proposal
+ * sets — would win (with or without contention), would lose to a
+ * named record, no change (the winner already sets this value), or
+ * would not derive (orphan in the union set). A proposal identical
+ * to the landed record of the same id is called out as no change. */
+function proposalVerdicts(landedGate, propGate, union) {
+  const lines = [];
+  const unionById = new Map(union.records.map((r) => [String(r.id), r]));
+  const landedById = new Map(
+    landedGate.kept.map((r) => [String(r.id), r]),
+  );
+  const orphanSet = new Set(union.out.orphans);
+  const setters = settersOf(union.records, union.out.orphans);
+  const conflictByKey = new Map(union.out.conflicts.map((c) => [c.key, c]));
+  const props = [...propGate.kept].sort((a, b) =>
+    cmpCodePoints(String(a.id), String(b.id)),
+  );
+  for (const p of props) {
+    const pid = String(p.id);
+    const landedTwin = landedById.get(pid);
+    if (landedTwin && indexKey(landedTwin) === indexKey(p)) {
+      lines.push(
+        `- proposal \`${pid}\` — identical to the landed record of the same id; no change if landed again`,
+      );
+      continue;
+    }
+    for (const k of Object.keys(effectsOf(p)).sort(cmpCodePoints)) {
+      const v = fmtValue(effectsOf(p)[k]);
+      if (orphanSet.has(pid)) {
+        lines.push(
+          `- proposal \`${pid}\` sets \`${k}\` = ${v} — would not derive: in the union set it is an orphan (a parent is absent from the landed records and the proposals)`,
+        );
+        continue;
+      }
+      const ids = setters.get(k) ?? [];
+      const wid = conflictByKey.get(k)?.winner ?? pickWinnerId(ids, unionById);
+      if (wid === pid) {
+        lines.push(
+          ids.length > 1
+            ? `- proposal \`${pid}\` sets \`${k}\` = ${v} — would win`
+            : `- proposal \`${pid}\` sets \`${k}\` = ${v} — would win; no contention`,
+        );
+      } else {
+        const wv = effectsOf(unionById.get(wid))[k];
+        lines.push(
+          pyDeepEqual(wv, effectsOf(p)[k])
+            ? `- proposal \`${pid}\` sets \`${k}\` = ${v} — no change if landed: \`${wid}\` already sets this value`
+            : `- proposal \`${pid}\` sets \`${k}\` = ${v} — would lose to \`${wid}\``,
+        );
+      }
+    }
+  }
+  return lines;
+}
+
+function fmtAge(iso, nowMs) {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  const sec = Math.max(0, Math.round((nowMs - t) / 1000));
+  if (sec < 90) return "just now";
+  const min = Math.round(sec / 60);
+  if (min < 90) return `${min} minutes ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 48) return `${hr} hours ago`;
+  return `${Math.round(hr / 24)} days ago`;
+}
+
+function rejectLinesFor(gate, fileRejects, proposed) {
+  const tag = proposed ? "proposed record" : "record";
+  const lines = [];
+  for (const r of fileRejects ?? []) {
+    lines.push(
+      `- \`${r.file}\`${proposed ? " (proposal)" : ""} — ${r.error}`,
+    );
+  }
+  for (const r of gate?.fullyRejected ?? []) {
+    lines.push(
+      `- ${tag} \`${r.id}\`${r.file ? ` (in \`${r.file}\`)` : ""} — none of its effect keys are declared in surface.json (sets ${r.keys.map((k) => `\`${k}\``).join(", ")}); it did not derive`,
+    );
+  }
+  for (const r of gate?.partialRejects ?? []) {
+    lines.push(
+      `- ${tag} \`${r.id}\`${r.file ? ` (in \`${r.file}\`)` : ""} — undeclared key(s) ${r.keys.map((k) => `\`${k}\``).join(", ")} did not derive; the rest of the record did`,
+    );
+  }
+  return lines;
+}
+
+function retiredLinesFor(gate) {
+  return (gate?.retired ?? []).map(
+    (r) =>
+      `- record \`${r.id}\`${r.file ? ` (in \`${r.file}\`)` : ""} — key(s) ${r.keys.map((k) => `\`${k}\``).join(", ")} were declared before and are not declared now; ` +
+      (r.partial
+        ? "the rest of the record derived. "
+        : "the record did not derive. ") +
+      "Preserved on `gitpp/state`; re-declaring the key revives it exactly as it was",
+  );
+}
+
+/** Assemble the surface Check text (design §4.3 anatomy): scope
+ * sentence first, advisory, rule order, basis line, the landed state
+ * table with per-key descriptions, rejected and retired material by
+ * name, then — previews only — the in-flight verdicts and the union
+ * state as a separate, labelled derivation; conflicts and orphans
+ * from the landed fold; the history-integrity line when record ids
+ * vanished since the last derivation; qualifications last, always.
+ * Truncation drops the union state first and the landed state last,
+ * each cut marked, under the same 65,000-char budget as Mapping A. */
+function renderSurfaceReport(args) {
+  const { surface, mode, sha, tipSha, tipTime } = args;
+  const now = args.now ?? Date.now();
+  const landed = args.landed;
+  const landedOut = landed.out;
+  const landedById = new Map(
+    landed.gate.kept.map((r) => [String(r.id), r]),
+  );
+  let title =
+    mode === "preview"
+      ? `git.pp surface — ${surface.name}, preview: what lands if these proposals do`
+      : `git.pp surface — ${surface.name}, as landed`;
+  if (title.length > 255) title = title.slice(0, 255);
+  const age = fmtAge(tipTime, now);
+  const basis =
+    `Surface basis: \`gitpp/state\` at \`${String(tipSha).slice(0, 7)}\` · ` +
+    (tipTime
+      ? `surface last changed ${tipTime}${age ? ` (${age})` : ""}`
+      : "surface last changed at an unknown time") +
+    ` · ${landed.rawCount} landed record(s)`;
+  const counts =
+    `Commit \`${String(sha).slice(0, 7)}\` · ${landed.rawCount} landed records · ` +
+    `${Object.keys(landedOut.state).length} keys · ` +
+    `${landedOut.conflicts.length} conflict(s) · ${landedOut.orphans.length} orphan(s)` +
+    (mode === "preview"
+      ? ` · ${args.proposals.gate.rawCount} proposed record(s)`
+      : "");
+  const head = [
+    `# ${title}`,
+    "",
+    SURFACE_SCOPE,
+    "",
+    ADVISORY,
+    RULE_ORDER,
+    "",
+    basis,
+    "",
+    counts,
+  ];
+  const stateLines = surfaceStateLines(surface, landedOut, landed.gate.kept);
+  const rejectLines = [
+    ...rejectLinesFor(landed.gate, landed.fileRejects, false),
+    ...(mode === "preview"
+      ? rejectLinesFor(
+          args.proposals.gate,
+          args.proposals.gate.fileRejects,
+          true,
+        )
+      : []),
+  ];
+  const retiredLines = retiredLinesFor(landed.gate);
+  const verdictLines =
+    mode === "preview"
+      ? proposalVerdicts(landed.gate, args.proposals.gate, args.proposals.union)
+      : [];
+  const unionStateLines =
+    mode === "preview"
+      ? surfaceStateLines(
+          surface,
+          args.proposals.union.out,
+          args.proposals.union.records,
+        )
+      : [];
+  const conflictBlocks = landedOut.conflicts.map((c) =>
+    explainConflict(c, landedById),
+  );
+  const orphanLines = landedOut.orphans.map((o) => `- \`${o}\``);
+  const historyLines = [];
+  if (args.vanished && args.vanished.ids.length > 0) {
+    const ids = args.vanished.ids;
+    const shown = ids.slice(0, 50);
+    historyLines.push(
+      `- ${ids.length} record(s) derived${args.vanished.at ? ` on ${args.vanished.at}` : ""} are absent from \`gitpp/state\` at \`${String(tipSha).slice(0, 7)}\`: ${shown.map((i) => `\`${i}\``).join(", ")}${ids.length > shown.length ? ` … and ${ids.length - shown.length} more` : ""} — the branch history was rewritten or records were deleted`,
+    );
+  }
+  let dropUnion = 0;
+  let dropVerdicts = 0;
+  let dropConflicts = 0;
+  let dropOrphans = 0;
+  let dropRetired = 0;
+  let dropRejects = 0;
+  let dropState = 0;
+  const build = () => {
+    const lines = [...head];
+    lines.push("", mode === "preview" ? "## State (as landed)" : "## State", "");
+    lines.push(...stateLines.slice(0, stateLines.length - dropState));
+    if (dropState > 0) lines.push(TRUNC_MARKER(dropState));
+    if (rejectLines.length > 0) {
+      lines.push("", "## Rejected input — named, never silent", "");
+      lines.push(...rejectLines.slice(0, rejectLines.length - dropRejects));
+      if (dropRejects > 0) lines.push(TRUNC_MARKER(dropRejects));
+    }
+    if (retiredLines.length > 0) {
+      lines.push("", "## Retired — declared before, not declared now", "");
+      lines.push(...retiredLines.slice(0, retiredLines.length - dropRetired));
+      if (dropRetired > 0) lines.push(TRUNC_MARKER(dropRetired));
+    }
+    if (mode === "preview") {
+      lines.push(
+        "",
+        "## In flight — proposed records (not landed)",
+        "",
+        "These records are proposals in this commit's tree. They are not landed, and the state above does not include them. The verdicts and the state below come from a separate derivation over the landed records plus these proposals.",
+        "",
+      );
+      lines.push(...verdictLines.slice(0, verdictLines.length - dropVerdicts));
+      if (dropVerdicts > 0) lines.push(TRUNC_MARKER(dropVerdicts));
+      lines.push(
+        "",
+        "### State if these proposals land — a separate derivation",
+        "",
+      );
+      lines.push(
+        ...unionStateLines.slice(0, unionStateLines.length - dropUnion),
+      );
+      if (dropUnion > 0) lines.push(TRUNC_MARKER(dropUnion));
+    }
+    const keptBlocks = conflictBlocks.slice(
+      0,
+      conflictBlocks.length - dropConflicts,
+    );
+    if (conflictBlocks.length > 0) {
+      lines.push("", "## Conflicts (losers preserved)", "");
+      for (const b of keptBlocks) lines.push(...b);
+      if (dropConflicts > 0) lines.push(TRUNC_MARKER(dropConflicts));
+    }
+    const keptOrphans = orphanLines.slice(0, orphanLines.length - dropOrphans);
+    if (orphanLines.length > 0) {
+      lines.push("", "## Orphans (excluded from state)", "");
+      lines.push(...keptOrphans);
+      if (dropOrphans > 0) lines.push(TRUNC_MARKER(dropOrphans));
+    }
+    if (historyLines.length > 0) {
+      lines.push("", "## History integrity", "", ...historyLines);
+    }
+    lines.push("", `> ${SURFACE_QUALIFICATIONS}`);
+    return lines.join("\n") + "\n";
+  };
+  let text = build();
+  const bump = (cond, inc) => {
+    while (text.length > MAX_TEXT && cond()) {
+      inc();
+      text = build();
+    }
+  };
+  bump(() => dropUnion < unionStateLines.length, () => dropUnion++);
+  bump(() => dropVerdicts < verdictLines.length, () => dropVerdicts++);
+  bump(() => dropConflicts < conflictBlocks.length, () => dropConflicts++);
+  bump(() => dropOrphans < orphanLines.length, () => dropOrphans++);
+  bump(() => dropRetired < retiredLines.length, () => dropRetired++);
+  bump(() => dropRejects < rejectLines.length, () => dropRejects++);
+  bump(() => dropState < stateLines.length, () => dropState++);
+  return { text, title, summary: counts };
+}
+
+/** The surface failure report: a surface exists (or a push to
+ * gitpp/state says one was intended) but could not be read at all —
+ * the declaration does not parse, or derivation itself failed. The
+ * surface path's one use of a failure conclusion, mirroring
+ * Mapping A's doctrine. */
+function renderSurfaceFailureText({ error = null, declError = null, sha = "" } = {}) {
+  const title = "git.pp surface — could not derive";
+  const lines = [`# ${title}`, "", SURFACE_SCOPE, "", ADVISORY, ""];
+  if (sha) {
+    lines.push(`Commit \`${String(sha).slice(0, 7)}\` · could not derive`, "");
+  }
+  lines.push("## What went wrong", "");
+  if (declError) lines.push(`- ${declError}`);
+  if (error) lines.push(`- Derivation failed: ${String(error).slice(0, 300)}`);
+  lines.push(
+    "",
+    "A surface is a `surface.json` declaration plus `records/*.json` " +
+      "on the `gitpp/state` branch — each record a plain object (or an " +
+      "array of them) with a non-empty string `id`, and optionally " +
+      "`parents` (an array of record ids), `kind` (a string), and " +
+      "`effects` (an object of key → value). Only keys declared in " +
+      "surface.json derive. See the surface description in the " +
+      "gitpp-app README: " +
+      "https://github.com/patchwork-quilt/gitpp-app#declared-surfaces-mapping-b",
+    "",
+    `> ${SURFACE_QUALIFICATIONS}`,
+  );
+  return {
+    title,
+    text: lines.join("\n") + "\n",
+    summary: "could not derive — surface unreadable",
+  };
+}
+
+async function ghGet(token, path) {
+  return fetch(`https://api.github.com${path}`, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": "gitpp-app-receiver",
+    },
+  });
+}
+
+/** Resolve the gitpp/state tip for a repo, through the hourly
+ * discovery cache (design §6.2 delta 1): a repo with no surface
+ * costs at most one probe per hour, never a call per push. A push
+ * to gitpp/state itself refreshes the cache directly (see
+ * deriveSurfaceAndPost), so this probe serves working-branch
+ * pushes and check_suite events. */
+async function probeSurfaceTip(env, token, repo) {
+  const key = `surfinfo:${repo}`;
+  try {
+    const raw = await env.CREDS.get(key);
+    if (raw) {
+      const info = JSON.parse(raw);
+      if (
+        info &&
+        typeof info.checkedAt === "number" &&
+        Date.now() - info.checkedAt < SURFACE_PROBE_TTL_MS
+      ) {
+        return info;
+      }
+    }
+  } catch {}
+  const info = { has: false, tipSha: null, tipTime: null, checkedAt: Date.now() };
+  const refRes = await ghGet(
+    token,
+    `/repos/${repo}/git/ref/heads/${encodeURIComponent(SURFACE_BRANCH)}`,
+  );
+  if (refRes.status === 404) {
+    try {
+      await env.CREDS.put(key, JSON.stringify(info), {
+        expirationTtl: 3600,
+      });
+    } catch {}
+    return info;
+  }
+  if (!refRes.ok) throw new Error(`surface probe HTTP ${refRes.status}`);
+  const refBody = await refRes.json();
+  const tipSha = refBody?.object?.sha ?? null;
+  if (!tipSha) {
+    try {
+      await env.CREDS.put(key, JSON.stringify(info), {
+        expirationTtl: 3600,
+      });
+    } catch {}
+    return info;
+  }
+  info.has = true;
+  info.tipSha = tipSha;
+  try {
+    const cRes = await ghGet(token, `/repos/${repo}/commits/${tipSha}`);
+    if (cRes.ok) {
+      const cb = await cRes.json();
+      info.tipTime =
+        cb?.commit?.committer?.date ?? cb?.commit?.author?.date ?? null;
+    }
+  } catch {}
+  try {
+    await env.CREDS.put(key, JSON.stringify(info), { expirationTtl: 3600 });
+  } catch {}
+  return info;
+}
+
+/** Fetch and gate the surface at a gitpp/state tip: one tarball call
+ * yields the declaration and the records together (design §2.1).
+ * Returns { declStatus: "ok" | "absent" | "invalid", ... }: "absent"
+ * means the branch carries no surface.json (no surface — quiet);
+ * "invalid" means one exists but cannot be read (never quiet). */
+async function fetchSurface(token, repo, tipSha) {
+  const res = await fetch(
+    `https://api.github.com/repos/${repo}/tarball/${tipSha}`,
+    {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": "gitpp-app-receiver",
+      },
+      redirect: "follow",
+    },
+  );
+  if (!res.ok) throw new Error(`surface tarball HTTP ${res.status}`);
+  const gz = new Uint8Array(await res.arrayBuffer());
+  if (gz.byteLength > MAX_GZ_BYTES) {
+    throw new TooLargeError(
+      `compressed tarball is ${gz.byteLength} bytes (limit ${MAX_GZ_BYTES})`,
+    );
+  }
+  const tar = await gunzip(gz);
+  if (tar.byteLength > MAX_TAR_BYTES) {
+    throw new TooLargeError(
+      `decompressed tar is ${tar.byteLength} bytes (limit ${MAX_TAR_BYTES})`,
+    );
+  }
+  const entries = parseTar(tar, (name) => SURFACE_FILE.test(name));
+  let declText = null;
+  const records = [];
+  const recordEntries = [];
+  const rejects = [];
+  let recordFileCount = 0;
+  for (const e of entries) {
+    if (SURFACE_JSON_PATH.test(e.name)) {
+      if (declText === null) {
+        declText =
+          e.text.charCodeAt(0) === 0xfeff ? e.text.slice(1) : e.text;
+      }
+    } else if (SURFACE_RECORD_PATH.test(e.name)) {
+      recordFileCount++;
+      if (recordFileCount > MAX_RECORD_FILES) {
+        throw new TooLargeError(
+          `more than ${MAX_RECORD_FILES} surface record files`,
+        );
+      }
+      gateRecordFile(
+        e.text,
+        displayPath(e.name),
+        records,
+        rejects,
+        recordEntries,
+      );
+    }
+  }
+  const base = { records, recordEntries, rejects, recordFileCount };
+  if (declText === null) return { declStatus: "absent", ...base };
+  let decl;
+  try {
+    decl = JSON.parse(declText);
+  } catch (err) {
+    return {
+      declStatus: "invalid",
+      declError: `surface.json does not parse: ${truncErr(err.message)}`,
+      ...base,
+    };
+  }
+  const v = validateSurface(decl);
+  if (v.error) {
+    return { declStatus: "invalid", declError: v.error, ...base };
+  }
+  return { declStatus: "ok", surface: v.surface, declRaw: decl, ...base };
+}
+
+async function readSurfaceManifest(env, repo) {
+  try {
+    const raw = await env.CREDS.get(`surfmanifest:${repo}`);
+    if (!raw) return null;
+    const m = JSON.parse(raw);
+    return m && Array.isArray(m.ids) ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Post the surface failure Check (conclusion "failure"), honouring
+ * the same GitHub-side idempotence as the neutral path. */
+async function postSurfaceFailure(token, repo, sha, failure) {
+  const existing = await existingCheckId(
+    token,
+    repo,
+    sha,
+    SURFACE_CHECK_NAME,
+  ).catch(() => null);
+  if (existing) return existing;
+  const { title, summary, text } = renderSurfaceFailureText({
+    ...failure,
+    sha,
+  });
+  return postCheckRun(token, repo, sha, {
+    title,
+    summary,
+    text,
+    conclusion: "failure",
+    name: SURFACE_CHECK_NAME,
+  });
+}
+
+async function deriveSurfaceAndPost(env, app, args, shared) {
+  const { repo, sha } = args;
+  const log = (action, detail) =>
+    appendRing(env, {
+      t: new Date().toISOString(),
+      event: "derive-surface",
+      repo,
+      sha: sha.slice(0, 7),
+      action,
+      ...(detail ? { detail: String(detail).slice(0, 120) } : {}),
+    }).catch(() => {});
+  const inflightKey = `inflight-s:${repo}:${sha}`;
+  const postedKey = `posted-s:${repo}:${sha}`;
+  let claimed = false;
+  let token = null;
+  let stage = "claim";
+  const releaseClaim = async () => {
+    if (!claimed) return;
+    claimed = false;
+    try {
+      await env.CREDS.delete(inflightKey);
+    } catch {}
+  };
+  try {
+    if (await env.CREDS.get(postedKey)) {
+      await log("skipped-duplicate", "posted marker exists for this commit");
+      return;
+    }
+    if (await env.CREDS.get(inflightKey)) {
+      await log("skipped-duplicate", "inflight claim held for this commit");
+      return;
+    }
+    await env.CREDS.put(inflightKey, "1", { expirationTtl: 600 });
+    claimed = true;
+    const instId = args.installationId ?? app.installation_id;
+    if (!instId) throw new Error("no installation id in payload or store");
+    stage = "token";
+    token = await installationToken(app, instId);
+    const isStatePush =
+      args.ref === `refs/heads/${SURFACE_BRANCH}` ||
+      args.headBranch === SURFACE_BRANCH;
+    stage = "discover";
+    let tipSha;
+    let tipTime;
+    if (isStatePush) {
+      tipSha = sha;
+      tipTime = args.headCommitTime ?? null;
+      // The push itself is the freshest discovery there is.
+      try {
+        await env.CREDS.put(
+          `surfinfo:${repo}`,
+          JSON.stringify({
+            has: true,
+            tipSha,
+            tipTime,
+            checkedAt: Date.now(),
+          }),
+          { expirationTtl: 3600 },
+        );
+      } catch {}
+    } else {
+      const info = await probeSurfaceTip(env, token, repo);
+      if (!info.has) {
+        await releaseClaim();
+        await log("skipped-no-surface");
+        return;
+      }
+      tipSha = info.tipSha;
+      tipTime = info.tipTime ?? null;
+    }
+    stage = "fetch-surface";
+    const surf = await fetchSurface(token, repo, tipSha);
+    if (surf.declStatus === "absent") {
+      await releaseClaim();
+      await log(
+        "skipped-no-declaration",
+        "gitpp/state carries no surface.json",
+      );
+      return;
+    }
+    if (surf.declStatus === "invalid") {
+      // A surface.json exists but cannot be read: never silent.
+      const fid = await postSurfaceFailure(token, repo, sha, {
+        declError: surf.declError,
+      });
+      await env.CREDS.put(postedKey, `failed:${fid}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log("posted", `failure check ${fid} — invalid surface.json`);
+      return;
+    }
+    const surface = surf.surface;
+    try {
+      await env.CREDS.put(
+        `surfdecl:${repo}:${tipSha}`,
+        JSON.stringify(surf.declRaw),
+        { expirationTtl: 30 * 86400 },
+      );
+    } catch {}
+    const manifest = await readSurfaceManifest(env, repo);
+    const prevPatterns = manifest?.patterns ?? [];
+    const landedGate = applyDeclarationGate(
+      surface,
+      surf.recordEntries,
+      prevPatterns,
+    );
+    // Proposals: only a working-branch push can carry them, and they
+    // ride in the tarball Mapping A already fetched (shared intake);
+    // the surface path fetches it itself only when Mapping A did not
+    // (its own duplicate path returns before fetching).
+    let propGate = null;
+    if (!isStatePush) {
+      stage = "fetch-proposals";
+      let intake = shared?.intake ?? null;
+      if (!intake) intake = await fetchRecords(token, repo, sha);
+      const propEntries = intake.proposalEntries ?? [];
+      const propFileRejects = intake.proposalRejects ?? [];
+      if (propEntries.length > 0 || propFileRejects.length > 0) {
+        propGate = applyDeclarationGate(surface, propEntries, prevPatterns);
+        propGate.rawCount = (intake.proposals ?? []).length;
+        propGate.fileRejects = propFileRejects;
+      }
+    }
+    let mode = "landed";
+    if (propGate) {
+      mode = "preview";
+    } else if (!isStatePush && surface.preview === "proposals-only") {
+      await releaseClaim();
+      await log(
+        "skipped-preview-off",
+        "preview is proposals-only and this push carries no proposals",
+      );
+      return;
+    }
+    stage = "derive";
+    const landedOut = derive(landedGate.kept);
+    let union = null;
+    if (mode === "preview") {
+      // Union derivation, kept strictly separate from the landed one:
+      // a proposal wins an id collision (it is the newer statement of
+      // that record), and the union is rendered under its own label.
+      const byId = new Map();
+      for (const r of landedGate.kept) byId.set(String(r.id), r);
+      for (const r of propGate.kept) byId.set(String(r.id), r);
+      const unionRecords = [...byId.values()];
+      union = { records: unionRecords, out: derive(unionRecords) };
+    }
+    // History integrity (design §5.2): ids the last posted derivation
+    // saw on the branch that this landed set no longer holds. The
+    // baseline is the branch's record set, gated but pre-declaration,
+    // so a record rejected for undeclared keys still counts as
+    // present — it is on the branch; only absence is history loss.
+    const landedIds = surf.records
+      .map((r) => String(r.id))
+      .sort(cmpCodePoints);
+    let vanished = null;
+    if (manifest) {
+      const nowIds = new Set(landedIds);
+      const gone = manifest.ids.filter((id) => !nowIds.has(id));
+      if (gone.length > 0) vanished = { ids: gone, at: manifest.at ?? null };
+    }
+    stage = "render";
+    const { text, title, summary } = renderSurfaceReport({
+      surface,
+      mode,
+      sha,
+      tipSha,
+      tipTime,
+      landed: {
+        gate: landedGate,
+        out: landedOut,
+        fileRejects: surf.rejects,
+        rawCount: surf.records.length,
+      },
+      proposals:
+        mode === "preview" ? { gate: propGate, union } : null,
+      vanished,
+    });
+    stage = "post";
+    const existing = await existingCheckId(
+      token,
+      repo,
+      sha,
+      SURFACE_CHECK_NAME,
+    ).catch(() => null);
+    if (existing) {
+      await env.CREDS.put(postedKey, `posted:${existing}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log("skipped-duplicate", `check ${existing} already exists`);
+      return;
+    }
+    const checkId = await postCheckRun(token, repo, sha, {
+      title,
+      summary,
+      text,
+      conclusion: "neutral",
+      name: SURFACE_CHECK_NAME,
+    });
+    await env.CREDS.put(postedKey, `posted:${checkId}`, {
+      expirationTtl: 86400,
+    });
+    // The manifest advances only on a posted derivation.
+    try {
+      await env.CREDS.put(
+        `surfmanifest:${repo}`,
+        JSON.stringify({
+          ids: landedIds,
+          patterns: surface.patterns,
+          tipSha,
+          at: new Date().toISOString(),
+        }),
+      );
+    } catch {}
+    await releaseClaim();
+    await log("posted", `check ${checkId} (${mode})`);
+  } catch (err) {
+    await releaseClaim();
+    // Never silent while we hold a token and the failure is not the
+    // Check POST itself — the same doctrine as Mapping A's loop.
+    if (token && stage !== "post") {
+      try {
+        const fid = await postSurfaceFailure(token, repo, sha, {
+          error: err?.message ?? String(err),
+        });
+        await env.CREDS.put(postedKey, `failed:${fid}`, {
+          expirationTtl: 86400,
+        });
+        await log("failed", `${err?.message ?? err} (failure check ${fid})`);
+        return;
+      } catch {}
+    }
+    await log("failed", err?.message ?? err);
+  }
+}
+
+/*END-EXTRACT:surface*/
+
 /** Decide whether a verified event triggers derivation, and run it
- * behind the ack. Returns nothing; never throws. */
+ * behind the ack. Returns nothing; never throws. Two independent
+ * derivations share the job: Mapping A ("git.pp state") first, then
+ * the Mapping B surface path ("git.pp surface"), which reuses
+ * Mapping A's tarball intake (the proposals ride in it) instead of
+ * fetching the pushed tree a second time. Sequential, so the intake
+ * is settled before the surface path looks for it; each path keeps
+ * its own claim keys, failure Checks and event-log entries. */
 function maybeDerive(env, ctx, app, event, payload) {
   let sha = null;
+  let ref = null;
+  let headBranch = null;
+  let headCommitTime = null;
   if (event === "push") {
     sha = payload?.after ?? null;
     if (!sha || /^0+$/.test(sha)) return;
+    ref = payload?.ref ?? null;
+    headCommitTime = payload?.head_commit?.timestamp ?? null;
   } else if (event === "check_suite") {
     if (!["requested", "rerequested"].includes(payload?.action ?? "")) return;
     sha = payload?.check_suite?.head_sha ?? null;
+    headBranch = payload?.check_suite?.head_branch ?? null;
     if (!sha) return;
   } else {
     return;
@@ -2215,9 +3304,18 @@ function maybeDerive(env, ctx, app, event, payload) {
   const repo = payload?.repository?.full_name ?? null;
   if (!repo) return;
   const installationId = payload?.installation?.id ?? null;
-  const job = deriveAndPost(env, app, { repo, sha, installationId }).catch(
-    () => {},
-  );
+  const shared = {};
+  const job = (async () => {
+    await deriveAndPost(env, app, { repo, sha, installationId }, shared).catch(
+      () => {},
+    );
+    await deriveSurfaceAndPost(
+      env,
+      app,
+      { repo, sha, ref, headBranch, headCommitTime, installationId },
+      shared,
+    ).catch(() => {});
+  })();
   if (ctx?.waitUntil) ctx.waitUntil(job);
   return job;
 }
