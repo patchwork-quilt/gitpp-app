@@ -1405,6 +1405,11 @@ const QUALIFICATIONS =
   "not settle semantic conflicts. Digests authenticate content, not " +
   "authorship. Arrival order is never an input.";
 
+const ORPHAN_DEFINITION =
+  "An orphan is a record whose parent is missing or did not itself derive.";
+
+const A_QUALIFICATIONS = QUALIFICATIONS + " " + ORPHAN_DEFINITION;
+
 function fmtValue(v) {
   return typeof v === "string" ? v : JSON.stringify(v);
 }
@@ -1579,7 +1584,7 @@ function renderReport(records, project, opts = {}) {
       lines.push("", "## Orphans (excluded from state)", "", keptOrphans.join("\n"));
       if (dropOrphans > 0) lines.push(TRUNC_MARKER(dropOrphans));
     }
-    lines.push("", `> ${QUALIFICATIONS}`);
+    lines.push("", `> ${A_QUALIFICATIONS}`);
     return lines.join("\n") + "\n";
   };
   let text = build();
@@ -1629,7 +1634,7 @@ function renderFailureText({ rejects = [], error = null, sha = "" } = {}) {
         "description in the gitpp-app README: " +
         "https://github.com/patchwork-quilt/gitpp-app#the-model",
       "",
-      `> ${QUALIFICATIONS}`,
+      `> ${A_QUALIFICATIONS}`,
     );
     return lines.join("\n") + "\n";
   };
@@ -2307,9 +2312,12 @@ const SURFACE_SCOPE =
   "the code merges cleanly.";
 
 const SURFACE_QUALIFICATIONS =
-  QUALIFICATIONS +
-  " The surface is what its records say, written by the people and " +
-  "agents named in them.";
+  QUALIFICATIONS + " The surface is what its records say.";
+
+const SURFACE_GLOSSARY =
+  "Landed records are the ones on `gitpp/state`; proposed records " +
+  "appear only in previews and are not landed. " +
+  ORPHAN_DEFINITION;
 
 /** Validate a parsed surface.json against the v1 schema (design
  * §2.2): version 1; a non-empty name; preview "full" (default) or
@@ -2625,19 +2633,6 @@ function proposalVerdicts(landedGate, propGate, union) {
   return lines;
 }
 
-function fmtAge(iso, nowMs) {
-  if (!iso) return null;
-  const t = Date.parse(iso);
-  if (!Number.isFinite(t)) return null;
-  const sec = Math.max(0, Math.round((nowMs - t) / 1000));
-  if (sec < 90) return "just now";
-  const min = Math.round(sec / 60);
-  if (min < 90) return `${min} minutes ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 48) return `${hr} hours ago`;
-  return `${Math.round(hr / 24)} days ago`;
-}
-
 function rejectLinesFor(gate, fileRejects, proposed) {
   const tag = proposed ? "proposed record" : "record";
   const lines = [];
@@ -2672,7 +2667,8 @@ function retiredLinesFor(gate) {
 }
 
 /** Assemble the surface Check text (design §4.3 anatomy): scope
- * sentence first, advisory, rule order, basis line, the landed state
+ * sentence first, advisory, rule order, basis line, the one-line
+ * glossary directly under the basis, the landed state
  * table with per-key descriptions, rejected and retired material by
  * name, then — previews only — the in-flight verdicts and the union
  * state as a separate, labelled derivation; conflicts and orphans
@@ -2682,7 +2678,6 @@ function retiredLinesFor(gate) {
  * each cut marked, under the same 65,000-char budget as Mapping A. */
 function renderSurfaceReport(args) {
   const { surface, mode, sha, tipSha, tipTime } = args;
-  const now = args.now ?? Date.now();
   const landed = args.landed;
   const landedOut = landed.out;
   const landedById = new Map(
@@ -2693,16 +2688,31 @@ function renderSurfaceReport(args) {
       ? `git.pp surface — ${surface.name}, preview: what lands if these proposals do`
       : `git.pp surface — ${surface.name}, as landed`;
   if (title.length > 255) title = title.slice(0, 255);
-  const age = fmtAge(tipTime, now);
+  // The basis segment names what this report's derivation actually
+  // was — a full landed derivation, or a proposals preview — not
+  // merely what the declaration's preview setting says.
+  const basisMode = mode === "preview" ? "preview: proposals" : "preview full";
   const basis =
     `Surface basis: \`gitpp/state\` at \`${String(tipSha).slice(0, 7)}\` · ` +
     (tipTime
-      ? `surface last changed ${tipTime}${age ? ` (${age})` : ""}`
-      : "surface last changed at an unknown time") +
-    ` · ${landed.rawCount} landed record(s)`;
+      ? `tip committed ${tipTime}`
+      : "tip committed at an unknown time") +
+    ` · ${landed.rawCount} landed record(s) · ${basisMode}`;
+  const setters = settersOf(landed.gate.kept, landedOut.orphans);
+  const keysSet = Object.keys(landedOut.state).length;
+  const declaredUnset = surface.patterns.filter((pattern) => {
+    if (pattern.prefix === null) return !setters.has(pattern.pattern);
+    for (const key of setters.keys()) {
+      if (key.startsWith(pattern.prefix)) return false;
+    }
+    return true;
+  }).length;
+  const keysSegment =
+    `${keysSet} key${keysSet === 1 ? "" : "s"} set` +
+    (declaredUnset > 0 ? ` · ${declaredUnset} declared unset` : "");
   const counts =
     `Commit \`${String(sha).slice(0, 7)}\` · ${landed.rawCount} landed records · ` +
-    `${Object.keys(landedOut.state).length} keys · ` +
+    `${keysSegment} · ` +
     `${landedOut.conflicts.length} conflict(s) · ${landedOut.orphans.length} orphan(s)` +
     (mode === "preview"
       ? ` · ${args.proposals.gate.rawCount} proposed record(s)`
@@ -2716,6 +2726,7 @@ function renderSurfaceReport(args) {
     RULE_ORDER,
     "",
     basis,
+    SURFACE_GLOSSARY,
     "",
     counts,
   ];
