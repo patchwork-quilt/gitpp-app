@@ -99,3 +99,21 @@ per derivation) is the irreducible REST spend, and it is small.
 This is why the receiver is built webhook-fed and stateless-but-
 cacheable from the first commit, and why M1 measures the real
 numbers before any derivation is allowed to call itself production.
+
+## 5. Surface derivations (Mapping B, 2026-10-22)
+
+The surface path keeps the same clone-class shape. Per surface
+derivation: one tarball fetch of `gitpp/state` (declaration +
+records together) + the fold + one Check post, plus the same
+token-mint and check-exists calls as a Mapping A derivation.
+Proposals add **zero** fetches — they ride in the pushed commit's
+tarball, which Mapping A already fetched (the surface path reuses
+that intake). Discovery is cached per repo for an hour
+(`surfinfo:<repo>`), so a repository with no surface costs at most
+one ref probe (plus one commit read on a hit) per hour rather than
+a call per push; a push to `gitpp/state` refreshes the cache from
+the payload itself. The declaration knob `preview:
+"proposals-only"` is the repo-side cost control: under `"full"`
+(the default) every working-branch push on a surface repo costs
+one as-landed Check post — the binding cap remains the secondary
+content-generating limit, as in §2.
