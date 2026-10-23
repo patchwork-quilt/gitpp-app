@@ -116,8 +116,13 @@ tarball, which Mapping A already fetched (the surface path reuses
 that intake). Discovery is cached per repo for an hour
 (`surfinfo:<repo>`), so a repository with no surface costs at most
 one ref probe (plus one commit read on a hit) per hour rather than
-a call per push; a push to `gitpp/state` refreshes the cache from
-the payload itself. The declaration knob `preview:
+a call per push; a push to `gitpp/state` refreshes the cache —
+since the adversarial-1 fixes (issue #13), that refresh costs one
+ref read per state-push derivation (plus one commit read when the
+ref has moved past the pushed sha): the refresh verifies the
+pushed sha against the branch ref and records the ref's current
+tip, monotonically, so the cache can never regress to a
+superseded tip. The declaration knob `preview:
 "proposals-only"` is the repo-side cost control: under `"full"`
 (the default) every working-branch push on a surface repo costs
 one as-landed Check post — the binding cap remains the secondary
