@@ -603,6 +603,13 @@ await push(REPO3, "refs/heads/gitpp/state", T3B, "2026-10-22T21:15:00Z");
     "S8: both all-retired records are listed under Retired",
   );
   ok(
+    text.includes(
+      "its effects did not derive, but the record still anchors its descendants. " +
+        "Preserved on `gitpp/state`; re-declaring the key revives its effects exactly as they were",
+    ) && !text.includes("the record did not derive"),
+    "S8: the all-retired line says its effects did not derive (the record still anchors), never that the record did not derive",
+  );
+  ok(
     text.includes("`oncall.primary` = rota-lead") &&
       text.includes("`task.claim.dock-7` = agent-dockhand"),
     "S8: descendants of the retired root still derive their declared keys",
