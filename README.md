@@ -52,8 +52,12 @@ verified deliveries, newest last.
   <https://github.com/apps/gitpp-app>, owned by the patchwork-quilt
   org, registered through the App Manifest flow from this repo's
   landing page.
-- One installation: on `patchwork-quilt/gitpp-demo-quilt`, and no
-  other repository (installation ID 173944467).
+- One installation (ID 173944467) covering three repositories:
+  `patchwork-quilt/gitpp-demo-quilt` (the records dogfood, from
+  registration day), `patchwork-quilt/gitpp-action` (added
+  2026-10-22 as the no-records control — its pushes derive to
+  `skipped-no-records`, the designed silence, observed live), and
+  `patchwork-quilt/gitpp-dogfood-day1` (the M2 live-day repo).
 - Signature-verified webhook intake: the receiver verifies
   `X-Hub-Signature-256` against the stored webhook secret and
   records each accepted delivery in the ring above.
@@ -89,9 +93,10 @@ verified deliveries, newest last.
   tarball for the pushed commit in full (one API call) — cheap at
   this scale, but there is no incremental path yet; the engine's
   frontier machinery is not wired into this Worker.
-- **More than one installation.** The code is installation-driven
-  (it uses the webhook's own installation id), but so far it has
-  only ever run for the one installation named above.
+- **A second installation.** The app has exactly one installation
+  so far. The code is installation-driven (every derivation uses
+  the webhook's own installation id) and nothing in it is specific
+  to the repositories named above.
 
 The landing page at <https://gitpp-app.superinstance.dev> now leads
 with the live status and keeps the manifest desk below it — read the
