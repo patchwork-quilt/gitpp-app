@@ -372,7 +372,7 @@ async function events(env) {
 // VENDORED FOLD ENGINE — DO NOT EDIT IN THIS REPO.
 //
 // Source : patchwork-quilt/git.pp-ng — src/fold.ts
-// Commit : c130862b354f8895e68a4a0d8349f27389e570e3
+// Commit : e296feabc3008a79ea25e7b73f5534f9454a579c
 // Via    : patchwork-quilt/gitpp-action lib/fold.ts (byte-identical
 //          vendoring of the same upstream commit), transpiled to plain
 //          JS (types stripped only — no semantic edits) for the Worker.
@@ -513,7 +513,7 @@ function parentsOf(rec) {
 }
 function effectsOf(rec) {
   const eff = rec.effects;
-  const out = {};
+  const out = Object.create(null);
   if (eff && typeof eff === "object" && !Array.isArray(eff)) {
     for (const [k, v] of Object.entries(eff)) {
       out[String(k)] = v;
@@ -547,18 +547,41 @@ function indexKey(rec) {
   delete rest.digest;
   return pyCanonical(rest);
 }
+function newStrMap() {
+  return Object.create(null);
+}
+function setOwn(obj, k, v) {
+  Object.defineProperty(obj, k, {
+    value: v,
+    writable: true,
+    enumerable: true,
+    configurable: true
+  });
+}
+function missingIdPlaceholder(rec) {
+  const r = rec;
+  const normalized = {
+    parents: parentsOf(rec).slice().sort(cmpCodePoints),
+    kind: r.kind ?? null,
+    effects: effectsOf(rec),
+    reason: r.reason ?? null
+  };
+  return "missing-id:" + sha256Hex(pyCanonical(normalized));
+}
+function effectiveId(rec) {
+  const id = rec.id;
+  return typeof id === "string" ? id : missingIdPlaceholder(rec);
+}
 function indexRecords(records) {
   const ordered = [...records].sort((a, b) => {
-    const ida = String(a.id ?? "");
-    const idb = String(b.id ?? "");
-    const byId = cmpCodePoints(ida, idb);
+    const byId = cmpCodePoints(effectiveId(a), effectiveId(b));
     if (byId !== 0)
       return byId;
     return cmpCodePoints(indexKey(a), indexKey(b));
   });
-  const idx = {};
+  const idx = newStrMap();
   for (const r of ordered) {
-    idx[String(r.id)] = r;
+    idx[effectiveId(r)] = r;
   }
   return idx;
 }
@@ -607,8 +630,8 @@ class MinHeap {
   }
 }
 function cycleAffected(nodes, parents) {
-  const indeg = {};
-  const children = {};
+  const indeg = newStrMap();
+  const children = newStrMap();
   for (const r of nodes) {
     indeg[r] = 0;
     children[r] = [];
@@ -641,8 +664,8 @@ function cycleAffected(nodes, parents) {
   return out;
 }
 function topological(nodes, parents) {
-  const indeg = {};
-  const children = {};
+  const indeg = newStrMap();
+  const children = newStrMap();
   for (const r of nodes) {
     indeg[r] = parents[r].length;
     children[r] = [];
@@ -673,10 +696,10 @@ function topological(nodes, parents) {
 function deriveLegacy(records) {
   const idx = indexRecords([...records]);
   const ids = new Set(Object.keys(idx));
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
-  const children = {};
+  const children = newStrMap();
   for (const rid of Object.keys(idx))
     children[rid] = [];
   for (const [rid, ps] of Object.entries(parents)) {
@@ -689,8 +712,9 @@ function deriveLegacy(records) {
   const orphan = new Set;
   const work = [];
   for (const rid of Object.keys(idx)) {
-    if (parents[rid].some((p) => !ids.has(p)))
+    if (typeof idx[rid].id !== "string" || parents[rid].some((p) => !ids.has(p))) {
       work.push(rid);
+    }
   }
   for (const rid of work)
     orphan.add(rid);
@@ -717,7 +741,7 @@ function deriveLegacy(records) {
   applied.sort(cmpCodePoints);
   const appliedSet = new Set(applied);
   const order = topological(new Set(applied), parents);
-  const anc = {};
+  const anc = newStrMap();
   for (const rid of order) {
     const a = new Set;
     for (const p of parents[rid]) {
@@ -729,7 +753,7 @@ function deriveLegacy(records) {
     }
     anc[rid] = a;
   }
-  const setters = {};
+  const setters = newStrMap();
   for (const rid of applied) {
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k])
@@ -778,7 +802,7 @@ function deriveLegacy(records) {
         return cmpCodePoints(ca[2], cb[2]);
       })[0];
     }
-    state[k] = effectsOf(idx[winner])[k];
+    setOwn(state, k, effectsOf(idx[winner])[k]);
     const distinct = new Set;
     for (const c of cands)
       distinct.add(pyValueKey(effectsOf(idx[c])[k]));
@@ -796,10 +820,10 @@ function deriveLegacy(records) {
 function prepareDerive(records) {
   const idx = indexRecords([...records]);
   const ids = new Set(Object.keys(idx));
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
-  const children = {};
+  const children = newStrMap();
   for (const rid of Object.keys(idx))
     children[rid] = [];
   for (const [rid, ps] of Object.entries(parents)) {
@@ -812,8 +836,9 @@ function prepareDerive(records) {
   const orphan = new Set;
   const work = [];
   for (const rid of Object.keys(idx)) {
-    if (parents[rid].some((p) => !ids.has(p)))
+    if (typeof idx[rid].id !== "string" || parents[rid].some((p) => !ids.has(p))) {
       work.push(rid);
+    }
   }
   for (const rid of work)
     orphan.add(rid);
@@ -893,7 +918,7 @@ function rowPopcount(anc, row) {
 function derive(records) {
   const { idx, parents, applied, order, orphan } = prepareDerive(records);
   const anc = buildAncestry(order, parents, idx);
-  const setters = {};
+  const setters = newStrMap();
   for (const rid of applied) {
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k])
@@ -943,7 +968,7 @@ function derive(records) {
         return cmpCodePoints(a, b);
       })[0];
     }
-    state[k] = effectsOf(idx[winner])[k];
+    setOwn(state, k, effectsOf(idx[winner])[k]);
     const distinct = new Set;
     for (const c of cands)
       distinct.add(pyValueKey(effectsOf(idx[c])[k]));
@@ -1148,7 +1173,7 @@ function checkpointRoot(records, at) {
   const members = frontierMembers(at);
   if (members === null)
     return null;
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const closure = closureIdsMulti(members, idx, parents);
@@ -1172,7 +1197,7 @@ function verifyCheckpoint(records, checkpoint) {
   if (members === null)
     return v2 ? "MISMATCH" : false;
   const idx = indexRecords([...records]);
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const closure = closureIdsMulti(members, idx, parents);
@@ -1193,7 +1218,7 @@ function buildCheckpoint(records, at) {
   const atId = String(at);
   if (!Object.prototype.hasOwnProperty.call(idx, atId))
     return null;
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const closure = closureIds(atId, idx, parents);
@@ -1212,7 +1237,7 @@ function buildCheckpoint(records, at) {
 }
 function buildFrontierCheckpoint(records, frontierIds) {
   const idx = indexRecords([...records]);
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   let members;
@@ -1273,7 +1298,7 @@ function deriveDelta(checkpoint, tailRecords) {
   if (!members.every((m) => closureIdSet.has(m)))
     return null;
   const idx = indexRecords([...closure]);
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const cl = closureIdsMulti(members, idx, parents);
@@ -1302,7 +1327,7 @@ function witnessFreshnessLegacy(records) {
   const idx = indexRecords([...records]);
   const out = derive(records);
   const applied = new Set(out.order);
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const ancestorsIncl = (start) => {
@@ -1323,14 +1348,14 @@ function witnessFreshnessLegacy(records) {
   for (const rid of out.order) {
     const kind = idx[rid].kind;
     if (kind === "witness")
-      result[rid] = total - ancestorsIncl(rid).size;
+      setOwn(result, rid, total - ancestorsIncl(rid).size);
   }
   return result;
 }
 function witnessFreshness(records) {
   const idx = indexRecords([...records]);
   const out = derive(records);
-  const parents = {};
+  const parents = newStrMap();
   for (const rid of Object.keys(idx))
     parents[rid] = parentsOf(idx[rid]);
   const anc = buildAncestry(out.order, parents, idx);
@@ -1339,7 +1364,7 @@ function witnessFreshness(records) {
   for (const rid of out.order) {
     const kind = idx[rid].kind;
     if (kind === "witness") {
-      result[rid] = total - (rowPopcount(anc, anc.pos.get(rid)) + 1);
+      setOwn(result, rid, total - (rowPopcount(anc, anc.pos.get(rid)) + 1));
     }
   }
   return result;
@@ -1815,10 +1840,16 @@ const PROJECT_PATH = /(^|\/)\.gitpp\/project\.json$/;
 // or a record that cannot be trusted — becomes a REJECT naming its file
 // (and element index, for array files) and the specific reason; rejects
 // never throw, never vanish silently, and never block the surviving
-// records from deriving. The gate exists because the fold indexes
-// records by id into plain objects: an id of "__proto__" or an effects
-// key of "__proto__" would otherwise corrupt or silently drop data,
-// and one file's JSON error used to abort the whole derivation.
+// records from deriving. The gate exists so one unreadable or
+// malformed file cannot abort the whole derivation (a single JSON error
+// used to do exactly that) and so every exclusion is a named reject,
+// never a silent drop. It deliberately does NOT reject "__proto__" ids
+// or effect keys: since the engine fix for git.pp-ng issue #38
+// (vendored above), those are ordinary input — an "__proto__" id is a
+// referenceable record and an "__proto__" effect key is an ordinary
+// state key, pinned by the upstream conformance corpus — and rejecting
+// them here would silently drop records the fold is specified to
+// derive.
 
 class TooLargeError extends Error {
   constructor(which) {
@@ -1860,9 +1891,6 @@ function gateRecord(candidate, file, index) {
   if (typeof candidate.id !== "string" || candidate.id.length === 0) {
     return reject("record id is missing or not a non-empty string");
   }
-  if (candidate.id === "__proto__") {
-    return reject('record id "__proto__" is not allowed');
-  }
   if (candidate.parents !== undefined) {
     if (
       !Array.isArray(candidate.parents) ||
@@ -1874,9 +1902,6 @@ function gateRecord(candidate, file, index) {
   if (candidate.effects !== undefined) {
     if (!isPlainObject(candidate.effects)) {
       return reject("effects is present but is not a plain object");
-    }
-    if (Object.prototype.hasOwnProperty.call(candidate.effects, "__proto__")) {
-      return reject('effects contains a "__proto__" key, which is not allowed');
     }
   }
   if (candidate.kind !== undefined && typeof candidate.kind !== "string") {
