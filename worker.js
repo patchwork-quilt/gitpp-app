@@ -2406,7 +2406,14 @@ function previouslyDeclared(prevPatterns, key) {
  *                 keys; records with no effect keys are structural
  *                 anchors (they carry ancestry, set nothing) and are
  *                 always kept — a record can only be rejected for
- *                 keys it actually sets;
+ *                 keys it actually sets. A record whose effect keys
+ *                 ALL retired is kept the same way, as an anchor
+ *                 with zero deriving effects: retirement is a
+ *                 declaration change, not a record defect, and it
+ *                 must not orphan the record's descendants (live
+ *                 acceptance drill 4). A record whose keys were
+ *                 never declared anchors nothing (fullyRejected);
+ *                 rejection and retirement stay distinct;
  *   fullyRejected [{id, file, keys}] records whose effect keys are
  *                 all undeclared (and none merely retired): rejected
  *                 input, named, never silent;
@@ -2414,7 +2421,8 @@ function previouslyDeclared(prevPatterns, key) {
  *                 records that still derived their declared keys;
  *   retired       [{id, file, keys, partial}] keys that a previous
  *                 declaration covered and this one does not. A record
- *                 whose only keys retired did not derive; a record
+ *                 whose only keys retired derives none of them (it
+ *                 stays in the graph as an anchor, above); a record
  *                 that also sets declared keys derived without them. */
 function applyDeclarationGate(surface, entries, prevPatterns) {
   const kept = [];
@@ -2452,6 +2460,15 @@ function applyDeclarationGate(surface, entries, prevPatterns) {
         keys: [...undeclared, ...retiredKeys],
       });
     } else {
+      // Every effect key retired: the record derives none of them,
+      // but it remains in the ancestry graph as a structural anchor
+      // (zero deriving effects), so retiring a key cannot orphan the
+      // records that descend from it. Dropping the record outright
+      // took the whole subtree down when the retired key was the
+      // root record's only key (live acceptance drill 4, Check
+      // 120182901327: genesis dropped, claim-dock-7 and oncall-rota
+      // orphaned, still-declared keys vanishing from state).
+      kept.push({ ...record, effects: {} });
       retired.push({ id, file, keys: retiredKeys, partial: false });
     }
   }
@@ -2734,7 +2751,7 @@ function renderSurfaceReport(args) {
     const ids = args.vanished.ids;
     const shown = ids.slice(0, 50);
     historyLines.push(
-      `- ${ids.length} record(s) derived${args.vanished.at ? ` on ${args.vanished.at}` : ""} are absent from \`gitpp/state\` at \`${String(tipSha).slice(0, 7)}\`: ${shown.map((i) => `\`${i}\``).join(", ")}${ids.length > shown.length ? ` … and ${ids.length - shown.length} more` : ""} — the branch history was rewritten or records were deleted`,
+      `- ${ids.length} record(s) present in the surface${args.vanished.at ? ` on ${args.vanished.at}` : ""} are absent from \`gitpp/state\` at \`${String(tipSha).slice(0, 7)}\`: ${shown.map((i) => `\`${i}\``).join(", ")}${ids.length > shown.length ? ` … and ${ids.length - shown.length} more` : ""} — the branch history was rewritten or records were deleted`,
     );
   }
   let dropUnion = 0;
@@ -2868,6 +2885,28 @@ async function ghGet(token, path) {
  * to gitpp/state itself refreshes the cache directly (see
  * deriveSurfaceAndPost), so this probe serves working-branch
  * pushes and check_suite events. */
+
+/** The tip commit's own time (committer date, author date as
+ * fallback), or null when the read fails. The basis line's "surface
+ * last changed" must come from the commit itself, never from
+ * whichever webhook twin happened to win the per-commit claim: a
+ * push payload carries head_commit.timestamp, but a check_suite
+ * payload carries no timestamp at all, so a surface derivation
+ * driven by the check_suite twin rendered "at an unknown time"
+ * even though the tip commit's time was always one read away
+ * (live acceptance drills 2, 3, 5B). One read, only made when no
+ * payload or cache supplied the time. */
+async function resolveTipTime(token, repo, tipSha) {
+  try {
+    const cRes = await ghGet(token, `/repos/${repo}/commits/${tipSha}`);
+    if (cRes.ok) {
+      const cb = await cRes.json();
+      return cb?.commit?.committer?.date ?? cb?.commit?.author?.date ?? null;
+    }
+  } catch {}
+  return null;
+}
+
 async function probeSurfaceTip(env, token, repo) {
   const key = `surfinfo:${repo}`;
   try {
@@ -2909,14 +2948,7 @@ async function probeSurfaceTip(env, token, repo) {
   }
   info.has = true;
   info.tipSha = tipSha;
-  try {
-    const cRes = await ghGet(token, `/repos/${repo}/commits/${tipSha}`);
-    if (cRes.ok) {
-      const cb = await cRes.json();
-      info.tipTime =
-        cb?.commit?.committer?.date ?? cb?.commit?.author?.date ?? null;
-    }
-  } catch {}
+  info.tipTime = await resolveTipTime(token, repo, tipSha);
   try {
     await env.CREDS.put(key, JSON.stringify(info), { expirationTtl: 3600 });
   } catch {}
@@ -3081,7 +3113,11 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
     let tipTime;
     if (isStatePush) {
       tipSha = sha;
-      tipTime = args.headCommitTime ?? null;
+      // A check_suite-driven derivation of a state-branch head has
+      // no payload timestamp (see resolveTipTime): read the commit
+      // itself rather than caching and rendering an unknown time.
+      tipTime =
+        args.headCommitTime ?? (await resolveTipTime(token, repo, tipSha));
       // The push itself is the freshest discovery there is.
       try {
         await env.CREDS.put(
@@ -3103,7 +3139,10 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
         return;
       }
       tipSha = info.tipSha;
-      tipTime = info.tipTime ?? null;
+      // A cached discovery entry may carry a null time (written by
+      // a derivation that could not resolve one); resolve it here
+      // so the basis line never depends on which twin derived last.
+      tipTime = info.tipTime ?? (await resolveTipTime(token, repo, tipSha));
     }
     stage = "fetch-surface";
     const surf = await fetchSurface(token, repo, tipSha);

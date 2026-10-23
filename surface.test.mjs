@@ -290,6 +290,63 @@ const REPO2 = "acme/ferry2";
 refTips.set(REPO, { sha: TIP_A, time: "2026-10-22T17:00:00Z" });
 refTips.set(REPO2, { sha: TIP_D, time: "2026-10-20T09:14:00Z" });
 
+// ---- fixtures for S8/S9/S10: the live dogfood-b1 shape -------------------------
+const T3A = S("7");
+const T3B = S("8");
+const T3C = S("5");
+const T4A = S("6");
+const REPO3 = "acme/ferry3";
+const REPO4 = "acme/ferry4";
+const LANDED_B1 = {
+  "records/genesis.json": J({
+    id: "genesis",
+    kind: "witness",
+    parents: [],
+    effects: { "deploy.hold": false },
+  }),
+  "records/claim-dock-7.json": J({
+    id: "claim-dock-7",
+    kind: "task",
+    parents: ["genesis"],
+    effects: { "task.claim.dock-7": "agent-dockhand" },
+  }),
+  "records/oncall-rota.json": J({
+    id: "oncall-rota",
+    kind: "task",
+    parents: ["genesis"],
+    effects: { "oncall.primary": "rota-lead" },
+  }),
+  "records/hold-storm.json": J({
+    id: "hold-storm",
+    kind: "task",
+    parents: ["genesis"],
+    effects: { "deploy.hold": true },
+    reason: "storm coming",
+  }),
+};
+tarballs.set(T3A, tarball({ "surface.json": J(DECL_V1), ...LANDED_B1 }));
+tarballs.set(T3B, tarball({ "surface.json": J(DECL_V2), ...LANDED_B1 }));
+tarballs.set(T3C, tarball({ "surface.json": J(DECL_V2), ...LANDED_B1 }));
+tarballs.set(
+  T4A,
+  tarball({
+    "surface.json": J(DECL_V1),
+    "records/bad-root.json": J({
+      id: "bad-root",
+      kind: "task",
+      parents: [],
+      effects: { "bogus.key": 1 },
+    }),
+    "records/child-1.json": J({
+      id: "child-1",
+      kind: "task",
+      parents: ["bad-root"],
+      effects: { "oncall.primary": "agent-child" },
+    }),
+  }),
+);
+refTips.set(REPO3, { sha: T3C, time: "2026-10-22T21:30:00Z" });
+
 // ---- unit: declaration validation + key matching --------------------------------
 {
   const good = api.validateSurface(DECL_V1);
@@ -510,6 +567,97 @@ await push(REPO, "refs/heads/gitpp/state", TIP_C, "2026-10-22T20:00:00Z");
     text.includes("the branch history was rewritten or records were deleted"),
     "S5: the line says what the absence means",
   );
+  ok(
+    text.includes("record(s) present in the surface on") &&
+      !text.includes("record(s) derived"),
+    "S5: the history line says present in the surface, not derived (the manifest holds ids present, derived or not)",
+  );
+}
+
+// ---- S8: retiring the root record's only key must not orphan its descendants -----
+// (live acceptance drill 4: genesis dropped out of the graph entirely, and
+// claim-dock-7 / oncall-rota orphaned behind it)
+at = posted.length;
+await push(REPO3, "refs/heads/gitpp/state", T3A, "2026-10-22T21:00:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S8: surface Check posts on the full declaration");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("`deploy.hold` = true — winner `hold-storm`") &&
+      text.includes("`oncall.primary` = rota-lead") &&
+      text.includes("`task.claim.dock-7` = agent-dockhand"),
+    "S8: baseline state derives all three keys",
+  );
+}
+at = posted.length;
+await push(REPO3, "refs/heads/gitpp/state", T3B, "2026-10-22T21:15:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S8: surface Check posts on the retire tip");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("## Retired — declared before, not declared now") &&
+      text.includes("`genesis`") &&
+      text.includes("`hold-storm`"),
+    "S8: both all-retired records are listed under Retired",
+  );
+  ok(
+    text.includes("`oncall.primary` = rota-lead") &&
+      text.includes("`task.claim.dock-7` = agent-dockhand"),
+    "S8: descendants of the retired root still derive their declared keys",
+  );
+  ok(!text.includes("`deploy.hold` ="), "S8: the retired key is absent from state");
+  ok(
+    text.includes("0 orphan(s)") && !text.includes("## Orphans"),
+    "S8: retirement orphans nobody",
+  );
+  ok(text.includes("0 conflict(s)"), "S8: no phantom conflict from the anchors");
+}
+
+// ---- S9: a never-declared record anchors nothing (rejection ≠ retirement) ---------
+at = posted.length;
+await push(REPO4, "refs/heads/gitpp/state", T4A, "2026-10-22T21:20:00Z");
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S9: surface Check posts");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("## Rejected input — named, never silent") &&
+      text.includes("`bad-root`") &&
+      text.includes("`bogus.key`"),
+    "S9: the never-declared record is rejected by name",
+  );
+  ok(
+    text.includes("## Orphans (excluded from state)") &&
+      text.includes("- `child-1`"),
+    "S9: the rejected record's child still orphans, named",
+  );
+  ok(
+    !text.includes("`oncall.primary` ="),
+    "S9: the orphan's declared key never reaches state",
+  );
+}
+
+// ---- S10: a check_suite-driven derivation resolves the tip time from the commit ---
+// (live acceptance drills 2/3/5B: the check_suite twin won the claim, the
+// payload carried no timestamp, and the basis line rendered unknown)
+at = posted.length;
+await api.maybeDerive(env, {}, app, "check_suite", {
+  action: "requested",
+  check_suite: { head_sha: T3C, head_branch: "gitpp/state" },
+  repository: { full_name: REPO3 },
+  installation: { id: 42 },
+});
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S10: the check_suite twin posts the surface Check");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("surface last changed 2026-10-22T21:30:00Z"),
+    "S10: basis time is read from the tip commit when the payload has none",
+  );
+  ok(!text.includes("unknown time"), "S10: no unknown-time basis line");
 }
 
 // ---- S7: preview proposals-only repo ----------------------------------------------

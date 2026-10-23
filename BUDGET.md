@@ -105,7 +105,12 @@ numbers before any derivation is allowed to call itself production.
 The surface path keeps the same clone-class shape. Per surface
 derivation: one tarball fetch of `gitpp/state` (declaration +
 records together) + the fold + one Check post, plus the same
-token-mint and check-exists calls as a Mapping A derivation.
+token-mint and check-exists calls as a Mapping A derivation, plus
+at most one commit read — made only when neither the webhook
+payload nor the discovery cache carries the tip commit's time
+(a check_suite-driven derivation has no payload timestamp; the
+basis line's last-changed time is read from the commit itself
+rather than rendered unknown).
 Proposals add **zero** fetches — they ride in the pushed commit's
 tarball, which Mapping A already fetched (the surface path reuses
 that intake). Discovery is cached per repo for an hour
