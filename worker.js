@@ -2664,9 +2664,10 @@ function retiredLinesFor(gate) {
     (r) =>
       `- record \`${r.id}\`${r.file ? ` (in \`${r.file}\`)` : ""} — key(s) ${r.keys.map((k) => `\`${k}\``).join(", ")} were declared before and are not declared now; ` +
       (r.partial
-        ? "the rest of the record derived. "
-        : "the record did not derive. ") +
-      "Preserved on `gitpp/state`; re-declaring the key revives it exactly as it was",
+        ? "the rest of the record derived. " +
+          "Preserved on `gitpp/state`; re-declaring the key revives it exactly as it was"
+        : "its effects did not derive, but the record still anchors its descendants. " +
+          "Preserved on `gitpp/state`; re-declaring the key revives its effects exactly as they were"),
   );
 }
 
