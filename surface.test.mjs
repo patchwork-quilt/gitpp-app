@@ -79,6 +79,10 @@ class KVStub {
 }
 
 const posted = []; // parsed check-run POST bodies, in order
+// S22: scripted check-runs LIST responses, consumed per matching GET:
+// [{ name, remaining, runs: [ids] }] — the first entry for a name with
+// remaining > 0 answers; anything unscripted falls back to empty.
+let checkListScript = null;
 const tarballs = new Map(); // sha -> gz Buffer
 const refTips = new Map(); // repo -> { sha, time } | null
 
@@ -103,6 +107,17 @@ globalThis.fetch = async (url, opts = {}) => {
     return Response.json({ object: { sha: tip.sha } });
   }
   if (u.includes("/check-runs?check_name=")) {
+    if (checkListScript) {
+      const name = decodeURIComponent(u.split("check_name=")[1] ?? "");
+      const entry = checkListScript.find(
+        (e) => e.name === name && e.remaining > 0,
+      );
+      if (entry) {
+        entry.remaining -= 1;
+        const runs = entry.runs.map((id) => ({ id }));
+        return Response.json({ total_count: runs.length, check_runs: runs });
+      }
+    }
     return Response.json({ total_count: 0, check_runs: [] });
   }
   m = u.match(/\/repos\/(.+)\/commits\/([0-9a-f]{40})$/);
@@ -1373,6 +1388,156 @@ await push(REPO10, "refs/heads/main", GW);
   ok(
     text.includes("`oncall.primary` = rota-lead"),
     "S19: everything else on the surface still derives",
+  );
+}
+
+// ---- S20: the report budget is BYTES, not characters (issue #17) -------------------
+// SCALE-1 measured the char-budget failure live: at 278 landed records
+// the stored text was exactly 65,536 bytes — GitHub's cap — ending
+// inside the History line, qualifications amputated, after the
+// renderer's 65,000-CHARACTER truncation had already engaged. This
+// fixture rebuilds that shape in the harness: a family description
+// heavy with multibyte text (CJK + emoji), repeated on every claim
+// line, so byte length outruns char length by ~1.7x. Post-fix the
+// assembled text must be ≤ 65,000 BYTES, must still end with the full
+// qualifications, and must show its truncation marker.
+const byteLen = (s) => new TextEncoder().encode(s).length;
+const REPO_SCALE = "acme/ferry-scale";
+const TIP_SCALE = S("3");
+{
+  const heavyDesc =
+    "Claim on one task — 担当する座席の記録：その請求を行った席が、請求の間ずっと担当する 🧑‍✈️ ための宣言です。";
+  const decl = {
+    version: 1,
+    name: "ferry-scale",
+    preview: "full",
+    keys: {
+      "task.claim.*": { description: heavyDesc },
+      "release.freeze": KEYS["release.freeze"],
+      "deploy.hold": KEYS["deploy.hold"],
+      "oncall.primary": KEYS["oncall.primary"],
+    },
+  };
+  const files = {
+    "surface.json": J(decl),
+    "records/genesis.json": J({
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "deploy.hold": false },
+    }),
+    "records/oncall-rota.json": J({
+      id: "oncall-rota",
+      kind: "task",
+      parents: ["genesis"],
+      effects: { "oncall.primary": "rota-lead" },
+    }),
+  };
+  for (let i = 1; i <= 320; i++) {
+    const n = String(i).padStart(4, "0");
+    files[`records/claim-k${n}.json`] = J({
+      id: `claim-k${n}`,
+      kind: "task",
+      parents: ["genesis"],
+      effects: { [`task.claim.k${n}`]: `agent-k${n}` },
+      reason: `claiming k${n} for the refit rotation`,
+    });
+  }
+  tarballs.set(TIP_SCALE, tarball(files));
+  refTips.set(REPO_SCALE, { sha: TIP_SCALE, time: "2026-10-22T17:00:00Z" });
+  const atScale = posted.length;
+  await push(REPO_SCALE, "refs/heads/gitpp/state", TIP_SCALE, "2026-10-22T17:00:00Z");
+  const sc = surfaceChecks(atScale);
+  eq(sc.length, 1, "S20: exactly one surface Check for the scale fixture");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    (sc[0]?.output.summary ?? "").includes("322 keys set · 1 declared unset"),
+    "S20: counts exact at scale (320 claims + hold + oncall set; freeze unset)",
+  );
+  ok(
+    byteLen(text) <= 65000,
+    `S20: assembled text is within the BYTE budget (got ${byteLen(text)} bytes)`,
+  );
+  ok(
+    byteLen(text) > 63000,
+    `S20: the fixture genuinely reaches the cap region (got ${byteLen(text)} bytes, ${text.length} chars)`,
+  );
+  ok(
+    text.trimEnd().endsWith("The surface is what its records say."),
+    "S20: the full qualifications blockquote survives as the final text",
+  );
+  ok(
+    text.includes("more entries truncated in this view"),
+    "S20: the truncation marker is present inside the stored text",
+  );
+}
+
+// ---- S21: the same byte budget on the Mapping A renderer ----------------------------
+// renderReport shares MAX_TEXT: 800 records whose values are CJK
+// strings (3 bytes per char) push the untruncated text far past
+// 65,536 bytes while its char count stays deceptively lower. The
+// assembled report must respect the byte budget and keep the
+// qualifications last.
+{
+  const recs = [
+    { id: "genesis", kind: "witness", parents: [], effects: { project: "byte-probe" } },
+  ];
+  for (let i = 0; i < 800; i++) {
+    recs.push({
+      id: `t${i}`,
+      kind: "task",
+      parents: ["genesis"],
+      effects: { [`key-${i}`]: "値".repeat(30) },
+    });
+  }
+  const { text } = api.renderReport(recs, "byte-probe", { sha: "0".repeat(40) });
+  ok(
+    byteLen(text) <= 65000,
+    `S21: Mapping A report within the BYTE budget (got ${byteLen(text)} bytes, ${text.length} chars)`,
+  );
+  ok(
+    byteLen(text) > 63000,
+    "S21: the fixture genuinely reaches the cap region",
+  );
+  ok(
+    text.trimEnd().endsWith("did not itself derive."),
+    "S21: Mapping A qualifications (with the orphan definition) survive last",
+  );
+  ok(
+    text.includes("more entries truncated in this view"),
+    "S21: the truncation marker is present",
+  );
+}
+
+// ---- S22: the pre-post recheck narrows the twin window ------------------------------
+// Both delivery twins can pass the KV claim and the post-render
+// exists check while neither has posted yet (SCALE-1: at 300 records
+// both twins posted, on both paths). postCheckRun therefore re-runs
+// the exists check immediately before POSTing. Script the list GETs:
+// the derive-time check sees nothing; by the pre-post recheck the
+// twin's run (424242) exists. The derivation must NOT post, and must
+// record the twin's id in its posted marker.
+const REPO_TWIN = "acme/ferry-twin";
+const TIP_TWIN = S("5");
+{
+  tarballs.set(TIP_TWIN, tarball(LANDED_A));
+  refTips.set(REPO_TWIN, { sha: TIP_TWIN, time: "2026-10-22T17:00:00Z" });
+  checkListScript = [
+    { name: "git.pp surface", remaining: 1, runs: [] },
+    { name: "git.pp surface", remaining: 99, runs: [424242] },
+  ];
+  const atTwin = posted.length;
+  await push(REPO_TWIN, "refs/heads/gitpp/state", TIP_TWIN, "2026-10-22T17:00:00Z");
+  checkListScript = null;
+  eq(
+    surfaceChecks(atTwin).length,
+    0,
+    "S22: no second Check posted once the twin's run exists at the pre-post recheck",
+  );
+  eq(
+    env.CREDS.m.get(`posted-s:${REPO_TWIN}:${TIP_TWIN}`),
+    "posted:424242",
+    "S22: the posted marker records the twin's check id",
   );
 }
 

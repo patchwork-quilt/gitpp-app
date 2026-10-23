@@ -100,30 +100,55 @@ This is why the receiver is built webhook-fed and stateless-but-
 cacheable from the first commit, and why M1 measures the real
 numbers before any derivation is allowed to call itself production.
 
-## 5. Surface derivations (Mapping B, 2026-10-22)
+## 5. Per-push call shape, measured (corrected 2026-10-23, SCALE-1)
 
-The surface path keeps the same clone-class shape. Per surface
-derivation: one tarball fetch of `gitpp/state` (declaration +
-records together) + the fold + one Check post, plus the same
-token-mint and check-exists calls as a Mapping A derivation, plus
-at most one commit read — made only when neither the webhook
-payload nor the discovery cache carries the tip commit's time
-(a check_suite-driven derivation has no payload timestamp; the
-basis line's last-changed time is read from the commit itself
-rather than rendered unknown).
-Proposals add **zero** fetches — they ride in the pushed commit's
-tarball, which Mapping A already fetched (the surface path reuses
-that intake). Discovery is cached per repo for an hour
-(`surfinfo:<repo>`), so a repository with no surface costs at most
-one ref probe (plus one commit read on a hit) per hour rather than
-a call per push; a push to `gitpp/state` refreshes the cache —
-since the adversarial-1 fixes (issue #13), that refresh costs one
-ref read per state-push derivation (plus one commit read when the
-ref has moved past the pushed sha): the refresh verifies the
-pushed sha against the branch ref and records the ref's current
-tip, monotonically, so the cache can never regress to a
-superseded tip. The declaration knob `preview:
-"proposals-only"` is the repo-side cost control: under `"full"`
-(the default) every working-branch push on a surface repo costs
-one as-landed Check post — the binding cap remains the secondary
-content-generating limit, as in §2.
+*This section replaces the per-derivation accounting this file
+originally carried for the surface path: SCALE-1 measured the
+deployed app on real pushes, and the unit that matters is the
+**push**, not the derivation.*
+
+Per **push** (not per derivation), the measured shape is: twin
+deliveries (push + check_suite) each enter the pipeline; the
+loser normally stops at the per-commit KV claim, but the claim
+is check-then-set and loses its race when derivation runs long —
+at 300 records both twins posted, on both paths, doubling the
+per-push cost. A single winning Mapping A derivation costs
+check-exists GET + tarball GET + a pre-post check-exists recheck
+GET + Check POST (4 calls), plus a token mint when the isolate's
+cached token is cold. (The recheck is the twin-window narrowing:
+immediately before posting, the app re-runs the exists check and
+skips if the twin's run now exists. It narrows the race to one
+GET + one POST; it cannot eliminate it — GitHub offers no atomic
+create-if-absent — so the defence stays layered: KV claim,
+exists check after render, pre-post recheck.) A Mapping B
+state-branch push additionally pays the Mapping A intake: its
+tarball fetch of the pushed tree (which finds no `.gitpp/records`
+and skips) runs once per twin that reaches it, ahead of the
+surface tarball; and, since the adversarial-1 fixes (PR #16,
+issue #13), one ref read per state-push derivation to refresh
+the discovery cache — ref-verified and monotonic, so the cache
+can never regress to a superseded tip — plus one commit read
+when the ref has moved past the pushed sha or when neither the
+payload nor the cache carries the tip commit's time (a
+check_suite-driven derivation has no payload timestamp; the basis
+line's last-changed time is read from the commit itself rather
+than rendered unknown).
+
+Report text was budgeted at 65,000 characters, but GitHub stores
+65,536 **bytes**; on description-heavy surfaces the posted text
+started losing its tail to silent amputation at ≈276–278 landed
+records (measured, SCALE-1), while the derivation itself
+remained exact. The budget is now 65,000 **bytes** (issue #17),
+counted in UTF-8 at every assembly site, so the qualifications
+blockquote — designed to sit last — verifiably survives.
+
+What has not changed: proposals add **zero** fetches — they ride
+in the pushed commit's tarball, which Mapping A already fetched
+(the surface path reuses that intake). Discovery is cached per
+repo for an hour (`surfinfo:<repo>`), so a repository with no
+surface costs at most one ref probe (plus one commit read on a
+hit) per hour rather than a call per push. The declaration knob
+`preview: "proposals-only"` remains the repo-side cost control:
+under `"full"` (the default) every working-branch push on a
+surface repo costs one as-landed Check post — the binding cap
+remains the secondary content-generating limit, as in §2.

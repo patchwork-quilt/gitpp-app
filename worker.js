@@ -1519,11 +1519,21 @@ const ADVISORY =
 const RULE_ORDER =
   "> How a winner is chosen: kind first (override beats task beats witness); within a kind, a record that descends from a rival supersedes it; any remaining tie breaks on ancestry — ancestors are all transitive ancestors, counted once each, excluding the record itself: most intent ancestors (task and override records) wins, then fewest witness ancestors, then smallest id. A record's reason is its author's note, never an input to the fold.";
 
-/** GitHub caps check-run output text at 65,535 chars; assemble to stay
- * under 65,000, truncating the State list first, then Conflicts, then
- * the rejected-input list, then Orphans — each cut marked in place.
- * The qualifications blockquote is always the final text. */
+/** GitHub caps check-run output text at 65,536 BYTES and amputates the
+ * overflow silently, mid-line, with no marker (issue #17; measured in
+ * SCALE-1: at 278 landed surface records the stored text was exactly
+ * 65,536 bytes, ending inside the History integrity line, the
+ * qualifications blockquote gone — while this assembly, budgeting
+ * 65,000 CHARACTERS, believed it had already truncated to fit). The
+ * budget is therefore counted in UTF-8 bytes, with the working limit
+ * at 65,000 bytes (536 bytes of headroom), so truncation decisions
+ * are made in the units GitHub enforces. Assembly truncates the State
+ * list first, then Conflicts, then the rejected-input list, then
+ * Orphans — each cut marked in place. The qualifications blockquote
+ * is always the final text. */
 const MAX_TEXT = 65000;
+const TEXT_ENCODER = new TextEncoder();
+const textBytes = (s) => TEXT_ENCODER.encode(s).length;
 const TRUNC_MARKER = (n) =>
   `… ${n} more entries truncated in this view; the derivation itself is complete`;
 
@@ -1588,19 +1598,19 @@ function renderReport(records, project, opts = {}) {
     return lines.join("\n") + "\n";
   };
   let text = build();
-  while (text.length > MAX_TEXT && dropState < stateLines.length) {
+  while (textBytes(text) > MAX_TEXT && dropState < stateLines.length) {
     dropState++;
     text = build();
   }
-  while (text.length > MAX_TEXT && dropConflicts < conflictBlocks.length) {
+  while (textBytes(text) > MAX_TEXT && dropConflicts < conflictBlocks.length) {
     dropConflicts++;
     text = build();
   }
-  while (text.length > MAX_TEXT && dropRejects < rejectLines.length) {
+  while (textBytes(text) > MAX_TEXT && dropRejects < rejectLines.length) {
     dropRejects++;
     text = build();
   }
-  while (text.length > MAX_TEXT && dropOrphans < orphanLines.length) {
+  while (textBytes(text) > MAX_TEXT && dropOrphans < orphanLines.length) {
     dropOrphans++;
     text = build();
   }
@@ -1639,7 +1649,7 @@ function renderFailureText({ rejects = [], error = null, sha = "" } = {}) {
     return lines.join("\n") + "\n";
   };
   let text = build();
-  while (text.length > MAX_TEXT && drop < rejectLines.length) {
+  while (textBytes(text) > MAX_TEXT && drop < rejectLines.length) {
     drop++;
     text = build();
   }
@@ -2211,12 +2221,28 @@ async function existingCheckId(token, repo, sha, name = "git.pp state") {
   return null;
 }
 
+/** Post a Check run — with the twin-window narrowing (SCALE-1):
+ * every push fires twin deliveries (push + check_suite) whose
+ * derivations race; the KV claim is check-then-set and the exists
+ * check after rendering can still lose when both twins render
+ * concurrently and neither has posted yet — at 300 records both
+ * twins posted, on both paths. So, immediately before the POST,
+ * re-run the exists check with a fresh GET: if a run for this
+ * commit + name now exists, skip and return it as not-posted.
+ * This narrows the window to one GET + one POST; it cannot close
+ * it — GitHub offers no atomic create-if-absent — so the defence
+ * remains layered: KV claim, exists check after render, and this
+ * pre-post recheck. Returns { id, posted }. */
 async function postCheckRun(
   token,
   repo,
   sha,
   { title, summary, text, conclusion, name = "git.pp state" },
 ) {
+  const preExisting = await existingCheckId(token, repo, sha, name).catch(
+    () => null,
+  );
+  if (preExisting) return { id: preExisting, posted: false };
   const res = await fetch(`https://api.github.com/repos/${repo}/check-runs`, {
     method: "POST",
     headers: {
@@ -2240,7 +2266,7 @@ async function postCheckRun(
     );
   }
   const created = await res.json();
-  return created.id;
+  return { id: created.id, posted: true };
 }
 
 /** Post the failure Check (conclusion "failure" — the one case this app
@@ -2250,12 +2276,13 @@ async function postFailureCheck(token, repo, sha, failure) {
   const existing = await existingCheckId(token, repo, sha).catch(() => null);
   if (existing) return existing;
   const { title, summary, text } = renderFailureText({ ...failure, sha });
-  return postCheckRun(token, repo, sha, {
+  const r = await postCheckRun(token, repo, sha, {
     title,
     summary,
     text,
     conclusion: "failure",
   });
+  return r.id;
 }
 
 async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
@@ -2341,12 +2368,25 @@ async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
       await log("skipped-duplicate", `check ${existing} already exists`);
       return;
     }
-    const checkId = await postCheckRun(token, repo, sha, {
+    const post = await postCheckRun(token, repo, sha, {
       title,
       summary,
       text,
       conclusion: "neutral",
     });
+    if (!post.posted) {
+      // The pre-post recheck found the twin's run: never a second.
+      await env.CREDS.put(postedKey, `posted:${post.id}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log(
+        "skipped-duplicate",
+        `check ${post.id} appeared before post (pre-post recheck)`,
+      );
+      return;
+    }
+    const checkId = post.id;
     await env.CREDS.put(postedKey, `posted:${checkId}`, {
       expirationTtl: 86400,
     });
@@ -3017,7 +3057,7 @@ function renderSurfaceReport(args) {
   };
   let text = build();
   const bump = (cond, inc) => {
-    while (text.length > MAX_TEXT && cond()) {
+    while (textBytes(text) > MAX_TEXT && cond()) {
       inc();
       text = build();
     }
@@ -3470,13 +3510,14 @@ async function postSurfaceFailure(token, repo, sha, failure) {
     ...failure,
     sha,
   });
-  return postCheckRun(token, repo, sha, {
+  const r = await postCheckRun(token, repo, sha, {
     title,
     summary,
     text,
     conclusion: "failure",
     name: SURFACE_CHECK_NAME,
   });
+  return r.id;
 }
 
 async function deriveSurfaceAndPost(env, app, args, shared) {
@@ -3697,13 +3738,28 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
       await log("skipped-duplicate", `check ${existing} already exists`);
       return;
     }
-    const checkId = await postCheckRun(token, repo, sha, {
+    const post = await postCheckRun(token, repo, sha, {
       title,
       summary,
       text,
       conclusion: "neutral",
       name: SURFACE_CHECK_NAME,
     });
+    if (!post.posted) {
+      // The pre-post recheck found the twin's run: never a second.
+      // The manifest is not advanced here — the twin that posted
+      // advances it with the same landed set.
+      await env.CREDS.put(postedKey, `posted:${post.id}`, {
+        expirationTtl: 86400,
+      });
+      await releaseClaim();
+      await log(
+        "skipped-duplicate",
+        `check ${post.id} appeared before post (pre-post recheck)`,
+      );
+      return;
+    }
+    const checkId = post.id;
     await env.CREDS.put(postedKey, `posted:${checkId}`, {
       expirationTtl: 86400,
     });
