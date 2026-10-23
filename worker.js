@@ -1468,7 +1468,7 @@ function explainConflict(conflict, byId) {
         const li = tieBreakCounts(loserId, byId, ancCache);
         why =
           "lost the tie-break among incomparable candidates of the same kind " +
-          `(most non-witness ancestors: ${li.intent} vs winner's ${winnerInfo.intent}; ` +
+          `(intent ancestors: ${li.intent} vs winner's ${winnerInfo.intent}; ` +
           `then fewest witness ancestors: ${li.wit} vs winner's ${winnerInfo.wit}; ` +
           "then smallest id)";
       }
@@ -1486,12 +1486,7 @@ const ADVISORY =
   "authorisation. This Check never gates a merge.";
 
 const RULE_ORDER =
-  "> How a winner is chosen: kind first (override beats task " +
-  "beats witness); within a kind, a record that descends from a " +
-  "rival supersedes it; any remaining tie breaks on ancestry — " +
-  "most non-witness ancestors, then fewest witness ancestors — " +
-  "then smallest id. A record's reason is its author's note, " +
-  "never an input to the fold.";
+  "> How a winner is chosen: kind first (override beats task beats witness); within a kind, a record that descends from a rival supersedes it; any remaining tie breaks on ancestry — ancestors are all transitive ancestors, counted once each, excluding the record itself: most intent ancestors (task and override records) wins, then fewest witness ancestors, then smallest id. A record's reason is its author's note, never an input to the fold.";
 
 /** GitHub caps check-run output text at 65,535 chars; assemble to stay
  * under 65,000, truncating the State list first, then Conflicts, then
