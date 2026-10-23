@@ -205,6 +205,14 @@ registered manifest above is what survived validation.
 - The fold resolves labelled key conflicts mechanically. It does
   **not** settle semantic conflicts, and a gitpp Check must never be
   read as claiming it did.
+- Advisory is the App's stance, not a platform limit. Every Check
+  this App posts on a derived state concludes `neutral` and gates
+  nothing by itself — but a repository admin can name
+  `git.pp state` in branch protection and make it a required
+  check. That is the admin's policy choice, and if they make it,
+  the one `failure` Check this App posts — a records surface it
+  cannot read at all ("could not derive") — will block the merge
+  until the records are fixed.
 - Content digests authenticate *content*, not authorship. A
   record's ancestry says what it descends from, not who is honest.
 - Contents read is repository-wide by platform design; the

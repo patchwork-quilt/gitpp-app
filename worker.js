@@ -1485,6 +1485,14 @@ const ADVISORY =
   "approval. A winner means precedence, not correctness or " +
   "authorisation. This Check never gates a merge.";
 
+const RULE_ORDER =
+  "> How a winner is chosen: kind first (override beats task " +
+  "beats witness); within a kind, a record that descends from a " +
+  "rival supersedes it; any remaining tie breaks on ancestry — " +
+  "most non-witness ancestors, then fewest witness ancestors — " +
+  "then smallest id. A record's reason is its author's note, " +
+  "never an input to the fold.";
+
 /** GitHub caps check-run output text at 65,535 chars; assemble to stay
  * under 65,000, truncating the State list first, then Conflicts, then
  * the rejected-input list, then Orphans — each cut marked in place.
@@ -1506,7 +1514,7 @@ function renderReport(records, project, opts = {}) {
     `${records.length} records · ${Object.keys(out.state).length} keys · ` +
     `${out.conflicts.length} conflict(s) · ${out.orphans.length} orphan(s)`;
   const scope = opts.sha ? `Commit \`${opts.sha.slice(0, 7)}\` · ${counts}` : counts;
-  const head = [`# ${title}`, "", ADVISORY, "", scope];
+  const head = [`# ${title}`, "", ADVISORY, RULE_ORDER, "", scope];
   const rejectFileCount = new Set(rejects.map((r) => r.file)).size;
   const rejectLines = rejects.map(
     (r) =>
