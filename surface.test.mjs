@@ -157,6 +157,12 @@ function ok(cond, name) {
 const eq = (a, b, name) =>
   ok(JSON.stringify(a) === JSON.stringify(b), `${name} (got ${JSON.stringify(a)})`);
 
+const ORPHAN_DEFINITION =
+  "An orphan is a record whose parent is missing or did not itself derive.";
+const SURFACE_GLOSSARY =
+  "Landed records are the ones on `gitpp/state`; proposed records appear only in previews and are not landed. " +
+  ORPHAN_DEFINITION;
+
 // ---- fixtures -------------------------------------------------------------------
 const S = (c) => c.repeat(40);
 const TIP_A = S("a");
@@ -434,10 +440,23 @@ await push(REPO, "refs/heads/gitpp/state", TIP_A, "2026-10-22T17:00:00Z");
     lines[2]?.startsWith("This Check derives the declared coordination surface only"),
     "S1: scope sentence is the first body line",
   );
+  const basisIdx = lines.findIndex((line) => line.startsWith("Surface basis:"));
   ok(
-    text.includes("`gitpp/state` at `aaaaaaa`") &&
-      text.includes("surface last changed 2026-10-22T17:00:00Z"),
-    "S1: basis line names the tip sha and last-changed time",
+    basisIdx >= 0 &&
+      lines[basisIdx].includes("`gitpp/state` at `aaaaaaa`") &&
+      lines[basisIdx].includes("tip committed 2026-10-22T17:00:00Z") &&
+      lines[basisIdx].includes("5 landed record(s) · preview full"),
+    "S1: basis line names the tip sha, the tip commit time, and the full landed mode",
+  );
+  eq(
+    lines[basisIdx + 1],
+    SURFACE_GLOSSARY,
+    "S1: glossary sits directly under the basis line",
+  );
+  ok(
+    text.includes("3 keys set · 1 declared unset") &&
+      (sc[0]?.output.summary ?? "").includes("3 keys set · 1 declared unset"),
+    "S1: counts state the set/unset rule (3 concrete keys set, release.freeze declared unset)",
   );
   ok(
     text.includes("`deploy.hold` = true — winner `mixed-1`"),
@@ -470,8 +489,9 @@ await push(REPO, "refs/heads/gitpp/state", TIP_A, "2026-10-22T17:00:00Z");
     "S1: the deploy.hold conflict is explained with its loser",
   );
   ok(
-    text.trimEnd().endsWith("agents named in them."),
-    "S1: surface qualifications close the Check",
+    text.trimEnd().endsWith("The surface is what its records say.") &&
+      !text.includes("written by the people"),
+    "S1: surface qualifications close the Check, with no authorship clause",
   );
   ok(
     env.CREDS.m.has(`surfmanifest:${REPO}`),
@@ -492,6 +512,24 @@ let previewText = "";
     sc[0]?.output.title,
     "git.pp surface — ferry-ops, preview: what lands if these proposals do",
     "S4: title is the preview form",
+  );
+  const previewLines = previewText.split("\n");
+  const previewBasisIdx = previewLines.findIndex((line) =>
+    line.startsWith("Surface basis:"),
+  );
+  ok(
+    previewBasisIdx >= 0 &&
+      previewLines[previewBasisIdx].includes("preview: proposals"),
+    "S4: basis line names the proposals-preview mode that produced this report",
+  );
+  eq(
+    previewLines[previewBasisIdx + 1],
+    SURFACE_GLOSSARY,
+    "S4: glossary sits directly under the basis line",
+  );
+  ok(
+    previewText.includes("3 keys set · 1 declared unset"),
+    "S4: counts state the landed set/unset rule in a preview",
   );
   ok(
     previewText.includes("## State (as landed)") &&
@@ -661,7 +699,7 @@ await api.maybeDerive(env, {}, app, "check_suite", {
   eq(sc.length, 1, "S10: the check_suite twin posts the surface Check");
   const text = sc[0]?.output.text ?? "";
   ok(
-    text.includes("surface last changed 2026-10-22T21:30:00Z"),
+    text.includes("tip committed 2026-10-22T21:30:00Z"),
     "S10: basis time is read from the tip commit when the payload has none",
   );
   ok(!text.includes("unknown time"), "S10: no unknown-time basis line");
@@ -687,6 +725,50 @@ await push(REPO2, "refs/heads/feature-y", CODE2);
   );
 }
 
+// ---- S11: the counts segment omits "declared unset" when none are unset ------------
+{
+  const surface = api.validateSurface({
+    version: 1,
+    name: "one-key",
+    preview: "full",
+    keys: { "only.key": { description: "The only declared key." } },
+  }).surface;
+  const records = [
+    {
+      id: "genesis",
+      kind: "witness",
+      parents: [],
+      effects: { "only.key": "set" },
+    },
+  ];
+  const gate = {
+    kept: records,
+    fullyRejected: [],
+    partialRejects: [],
+    retired: [],
+  };
+  const report = api.renderSurfaceReport({
+    surface,
+    mode: "landed",
+    sha: S("1"),
+    tipSha: S("2"),
+    tipTime: "2026-10-22T22:00:00Z",
+    landed: {
+      gate,
+      out: api.derive(records),
+      fileRejects: [],
+      rawCount: records.length,
+    },
+    proposals: null,
+    vanished: null,
+  });
+  ok(
+    report.text.includes("1 key set · 0 conflict(s)") &&
+      !report.text.includes("declared unset"),
+    "S11: zero declared-unset patterns render just the keys-set count",
+  );
+}
+
 // ---- S6: Mapping A regression on the real demo set ---------------------------------
 {
   const demoDir = `${process.env.HOME}/workspace/demo-quilt/.gitpp/records`;
@@ -706,11 +788,18 @@ await push(REPO2, "refs/heads/feature-y", CODE2);
       "utf8",
     ),
   );
-  const { out } = api.renderReport(recs, project.project, {
+  const report = api.renderReport(recs, project.project, {
     sha: "0".repeat(40),
     rejects: rej,
   });
+  const { out } = report;
   eq(recs.length, 8, "S6: demo set gates to 8 records");
+  ok(
+    report.text
+      .trimEnd()
+      .endsWith(`Arrival order is never an input. ${ORPHAN_DEFINITION}`),
+    "S6: Mapping A qualifications carry the orphan definition",
+  );
   eq(out.state["config.timeout"], 45, "S6: Mapping A still derives 45");
   const c = out.conflicts.find((x) => x.key === "config.timeout");
   eq(c?.winner, "override-1", "S6: winner is still override-1");
