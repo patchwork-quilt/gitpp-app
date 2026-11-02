@@ -28,10 +28,10 @@ curl https://gitpp-app.superinstance.dev/health
 
 curl https://gitpp-app.superinstance.dev/events
 # [{"t":"2026-10-22T00:43:43.700Z","event":"push",
-#   "repo":"patchwork-quilt/gitpp-demo-quilt","installation":173944467,
+#   "repo":"SuperInstance/gitpp-demo-quilt","installation":173944467,
 #   "action":null},
 #  {"t":"2026-10-22T00:43:44.987Z","event":"check_suite",
-#   "repo":"patchwork-quilt/gitpp-demo-quilt","installation":173944467,
+#   "repo":"SuperInstance/gitpp-demo-quilt","installation":173944467,
 #   "action":"requested"}]
 ```
 
@@ -53,11 +53,11 @@ verified deliveries, newest last.
   org, registered through the App Manifest flow from this repo's
   landing page.
 - One installation (ID 173944467) covering three repositories:
-  `patchwork-quilt/gitpp-demo-quilt` (the records dogfood, from
+  `SuperInstance/gitpp-demo-quilt` (the records dogfood, from
   registration day), `patchwork-quilt/gitpp-action` (added
   2026-10-22 as the no-records control — its pushes derive to
   `skipped-no-records`, the designed silence, observed live), and
-  `patchwork-quilt/gitpp-dogfood-day1` (the M2 live-day repo).
+  `SuperInstance/gitpp-dogfood-day1` (the M2 live-day repo).
 - Signature-verified webhook intake: the receiver verifies
   `X-Hub-Signature-256` against the stored webhook secret and
   records each accepted delivery in the ring above.
@@ -97,7 +97,7 @@ verified deliveries, newest last.
   `surface.test.mjs` (48 assertions over synthetic webhook
   deliveries: declaration gate, retired keys, proposal verdicts,
   history integrity, the proposals-only knob). **Not yet proven
-  live:** the dogfood repository `patchwork-quilt/gitpp-dogfood-b1`
+  live:** the dogfood repository `SuperInstance/gitpp-dogfood-b1`
   is scaffolded with a declared surface, but the App is not
   installed on it yet — that step, and the first live surface
   Check, belong to the acceptance run, not this status line.
@@ -377,7 +377,7 @@ On 2026-10-21, through the App Manifest flow starting from this
 repo's landing page, so the App is owned by the patchwork-quilt
 org: **gitpp-app, ID 5419092, <https://github.com/apps/gitpp-app>**.
 It is installed on exactly one repository,
-`patchwork-quilt/gitpp-demo-quilt` (installation 173944467). The
+`SuperInstance/gitpp-demo-quilt` (installation 173944467). The
 first submission was rejected by GitHub's manifest validation over
 the event list; the correction narrowed the events and never
 widened a permission. The callback's credential store failed once
@@ -435,7 +435,7 @@ One tool, one repo — take the one whose shape fits:
   the specification, the fold engine, the conformance corpus, and
   RESULTS.md, the measured ledger. Read it to know exactly what
   the fold does and does not claim.
-- **[gitpp-demo-quilt](https://github.com/patchwork-quilt/gitpp-demo-quilt)**
+- **[gitpp-demo-quilt](https://github.com/SuperInstance/gitpp-demo-quilt)**
   — the dogfood repository this App is installed on: the
   poc-quilt-1 record set (poc-quilt-1 is the dogfood project —
   the programme's original eight-record proof-of-concept set)

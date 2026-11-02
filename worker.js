@@ -2,7 +2,7 @@
 //
 // LIVE: the GitHub App this receiver serves is registered — gitpp-app,
 // app 5419092, owned by the patchwork-quilt org — and installed on
-// patchwork-quilt/gitpp-demo-quilt. Its record (id, webhook secret,
+// SuperInstance/gitpp-demo-quilt. Its record (id, webhook secret,
 // private key, installation id) lives in the CREDS KV namespace under
 // "app"; no secret value ever appears in a response or a log.
 //
@@ -112,7 +112,7 @@ function landingPage() {
 <p><strong>Status: live.</strong> The GitHub App exists —
 <a href="https://github.com/apps/gitpp-app">github.com/apps/gitpp-app</a>
 (app 5419092, owned by patchwork-quilt) — and is installed on
-patchwork-quilt/gitpp-demo-quilt. The receiver behind this page verifies
+SuperInstance/gitpp-demo-quilt. The receiver behind this page verifies
 and records its webhook deliveries (<a href="/events">recent events</a>;
 <a href="/health">health</a>). On each push it now derives the repo's
 git.pp state from its records and posts it as an advisory Check on the
