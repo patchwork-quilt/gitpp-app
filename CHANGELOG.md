@@ -4,7 +4,7 @@ All notable changes to gitpp-app. Versions name this repository's
 mainline; a version is tagged only when the tagged tree is the
 deployed Worker (see the 0.1.0 note).
 
-## [0.1.0] — untagged
+## [0.1.0] — 2026-11-02
 
 The first versioned line: the registered App, the derivation loop,
 and declared surfaces, as they stand on main.
@@ -46,10 +46,22 @@ and declared surfaces, as they stand on main.
   policy and data inventory added under `docs/` for the M3
   Marketplace step.
 
-**Why untagged:** the deployed Worker and this repo have diverged
-in both directions (verified by diff, 2026-11-02): the landing page
-deployed 2026-10-26 is not in this repo, and the SCALE-1 fixes
-above are not in the deployed script. The 0.1.0 tag waits for the
-reconciliation deploy that makes this tree the deployed Worker;
-tagging earlier would claim a version for code that is not what
-runs. See README → Status.
+- **2026-11-02 — Reconciliation deploy (tagging gate, resolved).**
+  Earlier today this entry stood untagged: the deployed Worker and
+  this repo had diverged in both directions (verified by diff) —
+  the landing page deployed 2026-10-26 was not in this repo, and
+  the SCALE-1 fixes above were not in the deployed script. The
+  deployed script was re-extracted from Cloudflare and re-diffed
+  against main (`6822a8c`): the divergence was still exactly those
+  two items, plus one inert header comment (the org-tidy repo
+  reference). The deployed `landingPage()` was ported into
+  `worker.js` byte-for-byte (commit `c413e54`; surface suite
+  138 passed, 0 failed; CI green), the tree was deployed via
+  `deploy/deploy.py`, and the deploy was verified end-to-end:
+  `/health` returns `{"status":"live","registered":true}`, the
+  landing page served before and after is byte-identical, and a
+  probe push to `SuperInstance/gitpp-demo-quilt` returned the
+  `git.pp state` Check ("poc-quilt-1"). Production now runs this
+  tree — including SCALE-1 — and the page production uniquely had
+  is preserved in the repo. **v0.1.0 is tagged on this tree: the
+  first tag at which repo == deployed.**

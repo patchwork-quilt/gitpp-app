@@ -111,6 +111,19 @@ installation state re-verified 2026-11-02):**
   landed") on the commit.
 - The App's credentials, held in the Worker's `CREDS` KV store —
   never in this repo, never rendered in a page or a log.
+- **A release tag naming the deployed Worker — `v0.1.0`.** On
+  2026-11-02 the deployed script was re-extracted from Cloudflare
+  and diffed against this repo: the divergence was exactly the
+  two known items — the 2026-10-26 landing page, present only in
+  production, and the SCALE-1 fixes, present only here — plus one
+  inert header comment. The deployed page was ported into
+  `worker.js` byte-for-byte, this tree was deployed via
+  `deploy/deploy.py`, and the result was verified end-to-end:
+  `/health` live, the landing page byte-identical before and
+  after, and a probe push to `SuperInstance/gitpp-demo-quilt`
+  returning the `git.pp state` Check (`poc-quilt-1`). The
+  `v0.1.0` tag names this tree — the first tag at which
+  repo == deployed.
 
 **Does not exist yet:**
 
@@ -118,21 +131,11 @@ installation state re-verified 2026-11-02):**
   tarball for the pushed commit in full (one API call) — cheap at
   this scale, but there is no incremental path yet; the engine's
   frontier machinery is not wired into this Worker.
-- **A release tag naming the deployed Worker.** This repo and the
-  deployed script have diverged in both directions, verified by
-  diffing the deployed script against this repo on 2026-11-02:
-  the landing page deployed 2026-10-26 is newer than the page in
-  this repo, and the SCALE-1 fixes merged here on 2026-10-23
-  (byte-budgeted Check text; the pre-post exists recheck) are not
-  in the deployed script. A reconciliation deploy — this repo's
-  Worker, carrying the deployed page — is pending; until it lands,
-  this repo is ahead of production in the derivation paths and
-  behind it in the page, and no version tag is claimed for the
-  deployed code.
 
-The landing page at <https://gitpp-app.superinstance.dev> now leads
-with the live status and keeps the manifest desk below it — read the
-desk as the register-your-own entry point (below).
+The landing page at <https://gitpp-app.superinstance.dev> is the
+2026-10-26 page, and it now lives in this repo (`landingPage()` in
+`worker.js`): it leads with the live status, explains both
+mappings, tabulates the permissions, and links the install page.
 
 ## The model
 
