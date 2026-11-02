@@ -105,57 +105,167 @@ ${body}
 }
 
 function landingPage() {
-  const manifestJson = JSON.stringify(MANIFEST, null, 2);
   return page(
     "gitpp-app — the git.pp GitHub App",
     `<h1>gitpp-app</h1>
-<p><strong>Status: live.</strong> The GitHub App exists —
-<a href="https://github.com/apps/gitpp-app">github.com/apps/gitpp-app</a>
-(app 5419092, owned by patchwork-quilt) — and is installed on
-SuperInstance/gitpp-demo-quilt. The receiver behind this page verifies
-and records its webhook deliveries (<a href="/events">recent events</a>;
-<a href="/health">health</a>). On each push it now derives the repo's
-git.pp state from its records and posts it as an advisory Check on the
-commit — the derivation loop below the ack, recorded in the same event
-ring.</p>
-<p>gitpp-app brings git.pp to GitHub: when agents and humans complete
-work concurrently against the same shared state — configuration keys, task
-claims, release freezes — it derives one deterministic state from their
-provenance-carrying records and posts it as a Check on the pushed commit:
-the winning value, the preserved losers, and the ancestry that decided.
-It resolves labelled key conflicts mechanically; it does not settle
-semantic conflicts.</p>
-<h2>The manifest this instance was created from</h2>
-<p>Shown in full — exactly this JSON, nothing hidden. It was sent to
-GitHub's App Manifest flow on the patchwork-quilt organisation's page, so
-the app is owned by the org, not by a personal account. The button below
-sends the same manifest again — that is how you register <em>your own</em>
-instance (a fork gets its own app, its own credentials, its own store);
-it does not change this instance.</p>
-<pre>${esc(manifestJson)}</pre>
+<p id="status">Status: this instance reports its state at
+<a href="/health">/health</a>.</p>
+<p><strong>gitpp-app derives the declared state of a repository
+from its records and posts that state as an advisory Check on the
+commit, named <code>git.pp state</code>.</strong> When agents and
+humans complete work concurrently against the same shared state —
+configuration keys, task claims, release freezes — their records
+carry the provenance, and the app folds them into one deterministic
+state: the winning value for each key, the preserved losers, and
+the ancestry that decided. For a repository that declares a
+surface on a <code>gitpp/state</code> branch, it derives that
+surface as well and posts it as a second Check, <code>git.pp
+surface</code>.</p>
+<figure style="margin:1.5rem 0">
+<svg viewBox="0 0 940 215" role="img" aria-labelledby="mapa-title" style="max-width:100%;height:auto;display:block" font-family="ui-monospace, Menlo, Consolas, monospace">
+<title id="mapa-title">Mapping A flow: a push becomes the advisory git.pp state Check</title>
+<defs><marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111"/></marker></defs>
+<g font-size="13" fill="#111">
+<rect x="0" y="8" width="168" height="72" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="84" y="38" text-anchor="middle">push to</text>
+<text x="84" y="56" text-anchor="middle">a repo</text>
+<line x1="169" y1="44" x2="191" y2="44" stroke="#111" stroke-width="1.5" marker-end="url(#arrA)"/>
+<rect x="193" y="8" width="168" height="72" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="277" y="38" text-anchor="middle">webhook → 202</text>
+<text x="277" y="56" text-anchor="middle">(ack first)</text>
+<line x1="362" y1="44" x2="384" y2="44" stroke="#111" stroke-width="1.5" marker-end="url(#arrA)"/>
+<rect x="386" y="8" width="168" height="72" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="470" y="29" text-anchor="middle">derive behind</text>
+<text x="470" y="46" text-anchor="middle">the ack:</text>
+<text x="470" y="63" text-anchor="middle">one tarball fetch</text>
+<line x1="555" y1="44" x2="577" y2="44" stroke="#111" stroke-width="1.5" marker-end="url(#arrA)"/>
+<rect x="579" y="8" width="168" height="72" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="663" y="29" text-anchor="middle">the fold:</text>
+<text x="663" y="46" text-anchor="middle">labelled key</text>
+<text x="663" y="63" text-anchor="middle">conflicts only</text>
+<line x1="748" y1="44" x2="770" y2="44" stroke="#111" stroke-width="1.5" marker-end="url(#arrA)"/>
+<rect x="772" y="8" width="168" height="72" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="856" y="29" text-anchor="middle">advisory Check</text>
+<text x="856" y="46" text-anchor="middle" font-weight="bold">git.pp state</text>
+<text x="856" y="63" text-anchor="middle">on the commit</text>
+<g font-size="11.5" fill="#444">
+<text x="938" y="102" text-anchor="end">can be required by an admin;</text>
+<text x="938" y="118" text-anchor="end">the app never blocks</text>
+<text x="938" y="134" text-anchor="end">a merge itself</text>
+</g>
+<path d="M856,148 V196 H84 V150" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrA)"/>
+<text x="470" y="188" text-anchor="middle" font-size="12" fill="#444">repos with no .gitpp/records get silence</text>
+</g>
+</svg>
+<figcaption>Mapping A — how a push becomes the <code>git.pp state</code> Check.</figcaption>
+</figure>
+<h2>What it reads</h2>
+<ul>
+<li>Records (JSON files) under <code>.gitpp/records/</code> on the
+pushed branch.</li>
+<li><code>surface.json</code> at the root of the
+<code>gitpp/state</code> branch: the declared surface — which keys
+exist, each with a human description. The surface's records live on
+that branch. Proposals under <code>.gitpp/proposals/</code> are
+derived as a separately labelled preview; they change nothing that
+has landed.</li>
+</ul>
+<p>A repository with neither gets silence: no Check, no noise.</p>
+<figure style="margin:1.5rem 0">
+<svg viewBox="0 0 980 222" role="img" aria-labelledby="mapb-title" style="max-width:100%;height:auto;display:block" font-family="ui-monospace, Menlo, Consolas, monospace">
+<title id="mapb-title">Mapping B surface flow: a declared surface becomes the git.pp surface Check</title>
+<defs><marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111"/></marker></defs>
+<g font-size="13" fill="#111">
+<rect x="0" y="10" width="310" height="66" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="155" y="37" text-anchor="middle">orphan branch gitpp/state:</text>
+<text x="155" y="55" text-anchor="middle">surface.json + records</text>
+<rect x="0" y="130" width="310" height="66" fill="none" stroke="#111" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="155" y="151" text-anchor="middle">PR proposals under</text>
+<text x="155" y="168" text-anchor="middle">.gitpp/proposals/</text>
+<text x="155" y="185" text-anchor="middle">(labelled preview)</text>
+<line x1="312" y1="48" x2="386" y2="94" stroke="#111" stroke-width="1.5" marker-end="url(#arrB)"/>
+<line x1="312" y1="158" x2="386" y2="112" stroke="#111" stroke-width="1.5" marker-end="url(#arrB)"/>
+<rect x="390" y="63" width="270" height="80" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="525" y="85" text-anchor="middle">surface derivation —</text>
+<text x="525" y="101" text-anchor="middle">declared keys only;</text>
+<text x="525" y="117" text-anchor="middle">undeclared keys</text>
+<text x="525" y="133" text-anchor="middle">rejected by name</text>
+<line x1="662" y1="103" x2="716" y2="103" stroke="#111" stroke-width="1.5" marker-end="url(#arrB)"/>
+<rect x="720" y="63" width="260" height="80" fill="#f7f7f7" stroke="#111" stroke-width="1.5"/>
+<text x="850" y="85" text-anchor="middle">Check <tspan font-weight="bold">git.pp surface</tspan> —</text>
+<text x="850" y="101" text-anchor="middle">scope line first:</text>
+<text x="850" y="117" text-anchor="middle">what was derived,</text>
+<text x="850" y="133" text-anchor="middle">what was not read</text>
+<g font-size="12" fill="#444">
+<text x="490" y="192" text-anchor="middle">retired keys stay listed as Retired;</text>
+<text x="490" y="210" text-anchor="middle">a force-push names the records that vanished</text>
+</g>
+</g>
+</svg>
+<figcaption>Mapping B — how a declared surface becomes the <code>git.pp surface</code> Check.</figcaption>
+</figure>
+<h2>Permissions and events — the whole list</h2>
 <table>
 <tr><th>Permission</th><th>Level</th><th>Why</th></tr>
-<tr><td>Metadata</td><td>Read</td><td>Platform baseline: which repos exist, who installed the app.</td></tr>
-<tr><td>Contents</td><td>Read</td><td>To read the record files. GitHub grants Contents repository-wide; there is no narrower grant. The app touches record paths only as a matter of published policy and open source — the limit is policy, not the grant, and this page says so in those words.</td></tr>
-<tr><td>Checks</td><td>Write</td><td>To post the derived state as a Check run on the pushed commit.</td></tr>
+<tr><td>Metadata</td><td>Read</td><td>Platform baseline: which repositories exist, who installed the app.</td></tr>
+<tr><td>Contents</td><td>Read</td><td>To read the record files and the surface declaration. GitHub grants Contents repository-wide; there is no narrower grant. The app reads record and surface paths only — that limit is published policy, not the grant, and this page says so in those words.</td></tr>
+<tr><td>Checks</td><td>Write</td><td>To post the derived state as Check runs on the pushed commit.</td></tr>
 </table>
-<p>Nothing else. No pull-request permission (the ancestry rides in the
-Check's own output), no administration, no repository creation, no
-contents write. Events: push and check_suite (installation events
-are delivered to every app by default and cannot be listed;
-pull_request events would require a pull-requests permission this
-app deliberately does not request — learned from GitHub's own
-manifest validation, 2026-10-21).</p>
-<form action="https://github.com/organizations/patchwork-quilt/settings/apps/new" method="post">
-<input type="hidden" name="manifest" value="${esc(JSON.stringify(MANIFEST))}">
-<p><button type="submit">Register your own instance with this manifest</button></p>
-</form>
-<p>After GitHub confirms, it redirects back here with a one-time code;
-this site exchanges it and stores the new App's credentials directly in
-its own credential store — nothing to copy, nothing to vault by hand.
-The confirmation page shows only the app's id, its GitHub URL, and the
-owning org; no secret value is ever displayed or logged by this
-site.</p>`,
+<p>Nothing else: no pull-requests permission, no administration,
+no contents write. The app never writes to a repository. The
+events it acts on are <code>push</code> and
+<code>check_suite</code>.</p>
+<h2>What the Checks do and do not claim</h2>
+<ul>
+<li>Resolution is <strong>mechanical</strong>: labelled key
+conflicts only, decided by declared rules — record kind first,
+then ancestry. The app does not settle semantic conflicts; if two
+records mean different things by the same key, that is a human
+question the Check can only display.</li>
+<li>Digests authenticate <strong>content, not
+authorship</strong>: a digest proves a record is the record that
+was folded, not who wrote it.</li>
+<li><strong>Arrival order is never an input.</strong> The same
+records derive the same state however they arrived.</li>
+<li>The Checks are <strong>advisory</strong>. A repository admin
+can require the <code>git.pp state</code> Check in branch
+protection — GitHub allows that for any Check — but the app
+itself does not demand it and cannot block a merge.</li>
+</ul>
+<h2>Install</h2>
+<p>Install the app on a repository from its GitHub page:
+<a href="https://github.com/apps/gitpp-app">github.com/apps/gitpp-app</a>.
+The app is owned by the
+<a href="https://github.com/patchwork-quilt">patchwork-quilt</a>
+organisation. If you would rather not install anything, the same
+fold runs in CI, with no install, via the
+<a href="https://github.com/patchwork-quilt/gitpp-action">gitpp-action</a>
+Action.</p>
+<h2>Living examples</h2>
+<ul>
+<li><a href="https://github.com/patchwork-quilt/gitpp-dogfood-day1">gitpp-dogfood-day1</a>
+— five agents worked one shared state for a day; every derivation
+the app posted matched an independent fold of the same records.</li>
+<li><a href="https://github.com/patchwork-quilt/gitpp-dogfood-b1">gitpp-dogfood-b1</a>
+— the surface drills, including a force-push that the
+<code>git.pp surface</code> Check named, record by record.</li>
+<li><a href="https://github.com/patchwork-quilt/gitpp-dogfood-sheet">gitpp-dogfood-sheet</a>
+— a lane sheet carried as git.pp records, derived by the Action
+in CI.</li>
+</ul>
+<p>Recent webhook deliveries this instance has processed are
+listed at <a href="/events">/events</a>.</p>
+<p><small>A SuperInstance tool, published in the patchwork-quilt
+organisation.</small></p>
+<script>
+fetch("/health").then(function (r) { return r.json(); }).then(function (h) {
+  var el = document.getElementById("status");
+  if (el && h && h.app) {
+    el.textContent = "Status: " + h.status + " — " + h.app +
+      (h.registered ? " (registered)" : " (not registered)");
+  }
+}).catch(function () {});
+</script>`,
   );
 }
 
