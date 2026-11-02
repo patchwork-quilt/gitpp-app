@@ -1,0 +1,101 @@
+# CI for gitpp-app.
+#
+# The one suite this repo has is the surface extraction harness,
+# surface.test.mjs: it extracts worker.js's core slice (the vendored
+# fold engine through the derivation paths), stubs fetch and KV, and
+# drives maybeDerive with synthetic webhook payloads — exactly as the
+# live webhook drives it. No network, no credentials, no Cloudflare.
+#
+# One fixture is external: section S6 regresses Mapping A against the
+# real demo set, read from ~/workspace/demo-quilt/.gitpp — the demo
+# repository's own records. CI checks out that public repository and
+# links it into place.
+#
+# MEASURED baseline, 2026-11-02, node v22.23.3, on a clean clone with
+# the fixture in place:
+#
+#   $ node surface.test.mjs   ->  "138 passed, 0 failed", exit 0
+#
+# The assert step requires the pass line to exist and the count to be
+# at least the measured baseline: a suite that silently shrinks, or
+# prints nothing, is a failure, not a pass. (The harness header says
+# "Run: bun surface.test.mjs"; the suite uses only node builtins and
+# runs identically under node — measured above.)
+#
+# There is deliberately NO deploy step. Deployment is a separate
+# documented procedure (deploy/deploy.py) and test CI must not be
+# able to deploy anything.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Minimum. This workflow only reads two public repos and runs tests.
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  surface:
+    name: surface harness (extraction, stubbed fetch/KV)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Measured baseline — see the header. A count below this means
+      # the suite shrank, was truncated, or stopped running.
+      MIN_PASSED: '138'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the demo-set fixture (S6 reads ~/workspace/demo-quilt)
+        uses: actions/checkout@v4
+        with:
+          repository: SuperInstance/gitpp-demo-quilt
+          path: .demo-fixture
+
+      - name: Link the fixture where the harness looks for it
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/workspace"
+          ln -s "$GITHUB_WORKSPACE/.demo-fixture" "$HOME/workspace/demo-quilt"
+          ls "$HOME/workspace/demo-quilt/.gitpp/records" | head -3
+
+      - name: setup node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run the harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          node surface.test.mjs 2>&1 | tee surface-output.txt
+
+      - name: Assert what was measured
+        shell: bash
+        run: |
+          set -euo pipefail
+          line=$(grep -E '^[0-9]+ passed, [0-9]+ failed$' surface-output.txt || true)
+          if [ -z "$line" ]; then
+            echo "::error::no pass line in harness output — the suite did not run to completion"
+            exit 1
+          fi
+          passed=$(echo "$line" | sed -E 's/^([0-9]+) passed.*/\1/')
+          failed=$(echo "$line" | sed -E 's/^[0-9]+ passed, ([0-9]+) failed$/\1/')
+          echo "harness: $line (baseline >= ${MIN_PASSED} passed, 0 failed)"
+          if [ "$failed" != "0" ]; then
+            echo "::error::$failed harness checks failed"
+            exit 1
+          fi
+          if [ "$passed" -lt "$MIN_PASSED" ]; then
+            echo "::error::only $passed checks passed, below the measured baseline of $MIN_PASSED"
+            exit 1
+          fi

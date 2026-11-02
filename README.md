@@ -46,18 +46,26 @@ verified deliveries, newest last.
 
 ## Status — what exists, what does not
 
-**Exists (verified 2026-10-21; derivation verified 2026-10-22):**
+**Exists (verified 2026-10-21; derivation verified 2026-10-22;
+installation state re-verified 2026-11-02):**
 
 - The App itself: `gitpp-app`, App ID 5419092,
   <https://github.com/apps/gitpp-app>, owned by the patchwork-quilt
   org, registered through the App Manifest flow from this repo's
   landing page.
-- One installation (ID 173944467) covering three repositories:
-  `SuperInstance/gitpp-demo-quilt` (the records dogfood, from
-  registration day), `patchwork-quilt/gitpp-action` (added
-  2026-10-22 as the no-records control — its pushes derive to
-  `skipped-no-records`, the designed silence, observed live), and
-  `SuperInstance/gitpp-dogfood-day1` (the M2 live-day repo).
+- Two installations. On the SuperInstance account (installation
+  177983265, added 2026-11-02 after those repositories transferred
+  to SuperInstance): `SuperInstance/gitpp-demo-quilt` (the records
+  dogfood, from registration day), `SuperInstance/gitpp-dogfood-day1`
+  (the M2 live-day repo), and `SuperInstance/gitpp-dogfood-b1` (the
+  Mapping B dogfood). On the patchwork-quilt org (installation
+  173944467): `patchwork-quilt/gitpp-action` (added 2026-10-22 as
+  the no-records control — its pushes derive to
+  `skipped-no-records`, the designed silence, observed live).
+  Re-verified 2026-11-02 with probe pushes to all three
+  SuperInstance repositories: each returned the expected Check —
+  `git.pp state` for demo-quilt and dogfood-day1,
+  `git.pp surface` for dogfood-b1.
 - Signature-verified webhook intake: the receiver verifies
   `X-Hub-Signature-256` against the stored webhook secret and
   records each accepted delivery in the ring above.
@@ -94,13 +102,13 @@ verified deliveries, newest last.
   and labelled as proposed, never landed. Same permissions, same
   advisory doctrine; the App still writes nothing. Specified in
   the Mapping B design; proven by the extraction harness in
-  `surface.test.mjs` (48 assertions over synthetic webhook
+  `surface.test.mjs` (138 checks over synthetic webhook
   deliveries: declaration gate, retired keys, proposal verdicts,
-  history integrity, the proposals-only knob). **Not yet proven
-  live:** the dogfood repository `SuperInstance/gitpp-dogfood-b1`
-  is scaffolded with a declared surface, but the App is not
-  installed on it yet — that step, and the first live surface
-  Check, belong to the acceptance run, not this status line.
+  history integrity, the proposals-only knob — all passing, and
+  run in CI on every push). **Proven live 2026-11-02:** the App
+  is installed on `SuperInstance/gitpp-dogfood-b1`, and a probe
+  push returned the `git.pp surface` Check ("ferry-ops, as
+  landed") on the commit.
 - The App's credentials, held in the Worker's `CREDS` KV store —
   never in this repo, never rendered in a page or a log.
 
@@ -110,10 +118,17 @@ verified deliveries, newest last.
   tarball for the pushed commit in full (one API call) — cheap at
   this scale, but there is no incremental path yet; the engine's
   frontier machinery is not wired into this Worker.
-- **A second installation.** The app has exactly one installation
-  so far. The code is installation-driven (every derivation uses
-  the webhook's own installation id) and nothing in it is specific
-  to the repositories named above.
+- **A release tag naming the deployed Worker.** This repo and the
+  deployed script have diverged in both directions, verified by
+  diffing the deployed script against this repo on 2026-11-02:
+  the landing page deployed 2026-10-26 is newer than the page in
+  this repo, and the SCALE-1 fixes merged here on 2026-10-23
+  (byte-budgeted Check text; the pre-post exists recheck) are not
+  in the deployed script. A reconciliation deploy — this repo's
+  Worker, carrying the deployed page — is pending; until it lands,
+  this repo is ahead of production in the derivation paths and
+  behind it in the page, and no version tag is claimed for the
+  deployed code.
 
 The landing page at <https://gitpp-app.superinstance.dev> now leads
 with the live status and keeps the manifest desk below it — read the
