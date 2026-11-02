@@ -27,22 +27,17 @@ curl https://gitpp-app.superinstance.dev/health
 # {"status":"live","app":"gitpp-app","registered":true}
 
 curl https://gitpp-app.superinstance.dev/events
-# [{"t":"2026-10-22T00:43:43.700Z","event":"push",
-#   "repo":"SuperInstance/gitpp-demo-quilt","installation":173944467,
-#   "action":null},
-#  {"t":"2026-10-22T00:43:44.987Z","event":"check_suite",
-#   "repo":"SuperInstance/gitpp-demo-quilt","installation":173944467,
-#   "action":"requested"}]
+# {"error":"not found"} — 404, on purpose (see below)
 ```
 
 What just happened: `/health` reports that a registered App's record
-is sitting in the Worker's credential store. `/events` is the ring of
-webhook deliveries the receiver has accepted — an entry exists only
-if its HMAC signature verified against the App's webhook secret
-first. The two entries above are from registration day: a push to the
-dogfood repository this App is installed on, and the check suite
-GitHub requested alongside it. The ring is live; it holds the last 20
-verified deliveries, newest last.
+is sitting in the Worker's credential store. `/events` answers 404:
+the ring of webhook deliveries the receiver has accepted — an entry
+exists only if its HMAC signature verified against the App's webhook
+secret first — was a public page during the dogfood phase, and is
+operator-only since v0.3.0 (the M3 gate). The operator reads it
+through the credential store, under the operator's own Cloudflare
+credentials; entries expire 30 days after they are written.
 
 ## Status — what exists, what does not
 
@@ -88,7 +83,8 @@ installation state re-verified 2026-11-02):**
   push that changes no records still re-derives and posts a fresh
   Check on the new commit — derivation is per commit, not per
   record-change. Repositories with no `.gitpp/records` get no
-  Check, though their deliveries still appear in `/events`. Proven
+  Check, though the receiver still records their deliveries in
+  its operator-only event log. Proven
   live on the demo repository: push → Check showing
   `config.timeout = 45`, winner `override-1`, losers
   `task-a`/`task-b`/`task-d` preserved.
@@ -224,7 +220,7 @@ reading the code:
 | `GET /` | Landing page and registration desk. Renders the exact manifest JSON a registration would send, next to the permission table. |
 | `GET /health` | `{"status":"live","app":"gitpp-app","registered":true}` once a registered App's record is in the `CREDS` store. A fresh deployment with an empty store answers `{"status":"dark",...,"registered":false}` — that is the honest pre-registration state, not an error. |
 | `POST /webhook` | No stored App record → `503 {"error":"not configured"}`. Stored record → signature verified: mismatch → `401`, nothing recorded; match → delivery recorded, `202`. |
-| `GET /events` | The recorded ring as JSON (last 20, newest last). **Public by design for the dogfood phase** — it is the proof surface that events are arriving. It carries no payload bodies and no sender data, and it gets gated before any Marketplace step. |
+| `GET /events` | **No such route (404).** The recorded delivery ring was public by design during the dogfood phase; it is operator-only since v0.3.0 — the operator reads it through the `CREDS` store, and entries expire after 30 days. Gating it was a hard M3 gate. |
 | `GET\|POST /setup/callback` | The manifest-flow conversion endpoint. Exchanges the single-use code GitHub redirects with, stores the resulting App record in `CREDS`, and renders only the App's id, URL, and owner login. |
 
 Failure behaviour, stated:
@@ -297,7 +293,8 @@ registered manifest above is what survived validation.
   record's ancestry says what it descends from, not who is honest.
 - Contents read is repository-wide by platform design; the
   record-paths-only limit is policy and public code, not the grant.
-- `/events` is public metadata during the dogfood phase.
+- `/events` was public metadata during the dogfood phase; since
+  v0.3.0 there is no public route to the delivery log.
 
 ## The deep layer
 
@@ -372,8 +369,10 @@ not the upload response.
 
 ### Verify it yourself
 
-- `curl https://gitpp-app.superinstance.dev/health` and `/events` —
-  the outputs at the top of this document, reproducible now.
+- `curl https://gitpp-app.superinstance.dev/health` — the output
+  at the top of this document, reproducible now; and
+  `curl https://gitpp-app.superinstance.dev/events` answers 404 —
+  the delivery log is operator-only.
 - Webhook negatives: `POST /webhook` with no valid signature and
   watch it refuse (`401` against the live instance; `503` against
   any deployment whose store is still empty).
@@ -424,8 +423,9 @@ with the delivery ring under `events`.
    The confirmation page shows only the App's id, its GitHub URL,
    and the owner login. `/health` flips to `registered: true`.
 5. Install the App on one repository (per-repo selection in
-   GitHub's install flow) and push. Verified deliveries appear at
-   `/events`.
+   GitHub's install flow) and push. Verified deliveries are
+   recorded in your receiver's event log (the `evt:` keys in your
+   `CREDS` store) — there is no public page for them.
 6. If the callback shows "Storage failed": the App still exists on
    GitHub. Under the App's settings, set a webhook secret and
    generate a private key, then write the record — app id,

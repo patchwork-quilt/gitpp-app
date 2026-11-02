@@ -4,6 +4,55 @@ All notable changes to gitpp-app. Versions name this repository's
 mainline; a version is tagged only when the tagged tree is the
 deployed Worker (see the 0.1.0 note).
 
+## [0.3.0] — 2026-11-02
+
+M3 gate-closing: the delivery log is operator-only, the two
+unexpired stores gain retention, and the privacy filing is final.
+
+- **`GET /events` is removed.** The recorded delivery ring was
+  public by design during the dogfood phase; gating it was a hard
+  Marketplace gate (Casey ruling, 2026-11-02). There is no route
+  and no header-auth variant: this Worker holds no operator
+  credential of its own — its only secrets are the App's GitHub
+  credentials, which are not reused across trust domains — so the
+  path falls through to the same 404 as every unlisted path. The
+  operator reads the ring through the CREDS store under their own
+  Cloudflare credentials; per-delivery lines also land in the
+  Workers logs. The landing page and README say so in the same
+  words.
+- **Retention, implemented.** The event log (`evt:` keys) and the
+  surface manifest (`surfmanifest:<repo>`) were the family's two
+  stores written without expiry. Both now write with a 30-day
+  `expirationTtl`, set by two named constants in worker.js
+  (`EVENT_LOG_RETENTION_SECONDS`,
+  `SURFACE_MANIFEST_RETENTION_SECONDS`) — operator-configurable;
+  30 days matches the surface declaration cache's existing period
+  and the window GitHub's Marketplace customer-experience
+  standard allows for deleting user data. A lapsed manifest
+  simply re-bases the history-integrity check at the next posted
+  derivation. Entries written before this release carried no
+  expiry; the operator deleted them (and the pre-2026-10-22
+  legacy `events` array) from the live store at deployment, so
+  every entry now held expires on a stated schedule. S24 in the
+  suite pins the new TTLs and the unchanged ones (inflight
+  600 s, posted 24 h, surfinfo 1 h, surfdecl 30 d).
+- **Privacy filing final.** `docs/PRIVACY.md` and
+  `docs/DATA-INVENTORY.md` lose their DRAFT markings: every
+  statement is now true of the code — the gated log, the coded
+  retentions, the uninstall/deletion story (uninstall is
+  immediate and self-service; stored entries expire within
+  30 days or sooner on request through the support route), the
+  24-hour incident-notification commitment, and the operator
+  contact (the repository's public issue tracker).
+- **Landing page completed.** `landingPage()` gains a "Privacy,
+  data, and support" section: the privacy policy and data
+  inventory, the normative spec (git.pp-ng DESIGN.md) and the
+  conformance corpus, the support route, and the statement that
+  the delivery log is not public. The former `/events` link is
+  gone.
+- Tests: 152 assertions (was 144) — S24 pins the retention TTLs
+  across every scenario write.
+
 ## [0.2.0] — 2026-11-02
 
 Retraction is fold law in the vendored engine (git.pp-ng v0.2.0, Casey

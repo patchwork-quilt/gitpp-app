@@ -30,15 +30,23 @@
 //                        secret is read from the stored CREDS "app"
 //                        record. Verified events are appended to the
 //                        event log in CREDS — one key per entry,
-//                        "evt:<timestamp>:<rand>", read via /events —
-//                        and answered 202; push / check_suite events
+//                        "evt:<timestamp>:<rand>", expiring after
+//                        30 days — and answered 202; push /
+//                        check_suite events
 //                        then trigger derivation behind the ack (see
 //                        DERIVATION LOOP below): the repo's .gitpp
 //                        records are fetched as a tarball, gated,
 //                        folded, and posted back as an advisory Check.
-//   GET  /events         the recorded event log, as JSON (last 20,
-//                        newest last). Public by design for the
-//                        dogfood phase (see README).
+//   (no /events route)   the recorded event log is OPERATOR-ONLY
+//                        since v0.3.0 (the M3 gate): there is no
+//                        public route to it, and /events answers
+//                        404 like every other unlisted path. The
+//                        operator reads the ring through the CREDS
+//                        store, under the operator's own Cloudflare
+//                        credentials; per-delivery lines also land
+//                        in the Workers logs. It was public during
+//                        the dogfood phase; gating it was a hard
+//                        Marketplace gate (see README).
 //   GET  /health         {"status":"dark",...} until CREDS holds an
 //                        "app" record, then {"status":"live",...}.
 //
@@ -253,8 +261,27 @@ the app posted matched an independent fold of the same records.</li>
 — a lane sheet carried as git.pp records, derived by the Action
 in CI.</li>
 </ul>
-<p>Recent webhook deliveries this instance has processed are
-listed at <a href="/events">/events</a>.</p>
+<h2>Privacy, data, and support</h2>
+<p>The App's privacy policy and its full data inventory — what
+it receives, what it stores, how long each store is kept, and
+how deletion works — are published in its repository:
+<a href="https://github.com/patchwork-quilt/gitpp-app/blob/main/docs/PRIVACY.md">privacy
+policy</a> ·
+<a href="https://github.com/patchwork-quilt/gitpp-app/blob/main/docs/DATA-INVENTORY.md">data
+inventory</a>. The fold's normative specification and its
+conformance corpus live in
+<a href="https://github.com/patchwork-quilt/git.pp-ng">git.pp-ng</a>:
+<a href="https://github.com/patchwork-quilt/git.pp-ng/blob/main/DESIGN.md">DESIGN.md</a>
+·
+<a href="https://github.com/patchwork-quilt/git.pp-ng/tree/main/conformance">conformance
+corpus</a>.</p>
+<p>Support — questions, problems, and data-deletion requests —
+is via the repository's issue tracker:
+<a href="https://github.com/patchwork-quilt/gitpp-app/issues">github.com/patchwork-quilt/gitpp-app/issues</a>.</p>
+<p>This instance's delivery log is <strong>not public</strong>:
+there is no public <code>/events</code> route. The operator
+reads it through the instance's own credential store, under
+the operator's Cloudflare account.</p>
 <p><small>A SuperInstance tool, published in the patchwork-quilt
 organisation.</small></p>
 <script>
@@ -447,36 +474,15 @@ async function webhook(request, env, ctx) {
   return Response.json({ accepted: true }, { status: 202 });
 }
 
-async function events(env) {
-  const out = [];
-  if (env.CREDS) {
-    // Legacy entries: the pre-2026-10-22 ring was one read-modify-write
-    // array under "events". Those entries all predate the per-entry
-    // keys below, so they merge first, in their stored order.
-    try {
-      const raw = await env.CREDS.get("events");
-      const parsed = raw ? JSON.parse(raw) : [];
-      if (Array.isArray(parsed)) out.push(...parsed);
-    } catch {}
-    // Per-entry keys "evt:<ISO timestamp>:<rand>": list() returns keys
-    // in lexicographic order, which is chronological for ISO stamps.
-    try {
-      let cursor;
-      for (let pageN = 0; pageN < 10; pageN++) {
-        const res = await env.CREDS.list({ prefix: "evt:", cursor });
-        for (const k of res.keys) {
-          try {
-            const v = await env.CREDS.get(k.name);
-            if (v) out.push(JSON.parse(v));
-          } catch {}
-        }
-        if (res.list_complete || !res.cursor) break;
-        cursor = res.cursor;
-      }
-    } catch {}
-  }
-  return Response.json(out.slice(-20));
-}
+// The public /events reader that used to live here was removed in
+// v0.3.0 (M3): the delivery log is operator-only. The ring is still
+// written (appendRing, below) and still expires; the operator reads
+// it through the CREDS store under their own Cloudflare credentials.
+// There is deliberately no route and no header-auth variant: this
+// Worker holds no operator credential of its own (its only secrets
+// are the App's GitHub credentials, which are not reused for other
+// trust domains), and inventing one was worse than closing the
+// route. See the header comment.
 
 /*TEST-EXTRACT:core*/
 // ============================================================================
@@ -2529,6 +2535,24 @@ async function fetchRecords(token, repo, sha) {
 
 // ---- The loop ---------------------------------------------------------------
 
+// ---- Retention ---------------------------------------------------------------
+//
+// Operator-configurable retention for the two stores that were
+// written without expiry through the dogfood phase: the event log
+// (the "evt:" keys appended by appendRing below) and the surface
+// manifest ("surfmanifest:<repo>", written by the surface loop).
+// Both periods are 30 days — the same period the surface
+// declaration cache already used, and the window GitHub's
+// Marketplace customer-experience standard allows for deleting
+// user data after a request or an uninstall. To run a different
+// period, change these two constants: every write site reads
+// them, and docs/DATA-INVENTORY.md states the periods they set.
+// (KV enforces expirationTtl at write time; entries written
+// before v0.3.0 carried no expiry and were purged by the operator
+// when this landed — see the v0.3.0 changelog.)
+const EVENT_LOG_RETENTION_SECONDS = 30 * 86400;
+const SURFACE_MANIFEST_RETENTION_SECONDS = 30 * 86400;
+
 function rand6() {
   const b = new Uint8Array(3);
   crypto.getRandomValues(b);
@@ -2539,12 +2563,17 @@ function rand6() {
  * ("evt:<ISO timestamp>:<rand6>"). The old ring was a single
  * read-modify-write array: two simultaneous deliveries could read the
  * same array and the later write silently dropped the earlier entry.
- * Per-entry keys make appends independent; /events lists and merges.
+ * Per-entry keys make appends independent. Entries expire after
+ * EVENT_LOG_RETENTION_SECONDS. The ring is operator-only (no
+ * public route since v0.3.0); the operator reads it through the
+ * credential store.
  * Never throws — the log is a courtesy surface, not a gate. */
 async function appendRing(env, entry) {
   try {
     const key = `evt:${entry.t}:${rand6()}`;
-    await env.CREDS.put(key, JSON.stringify(entry));
+    await env.CREDS.put(key, JSON.stringify(entry), {
+      expirationTtl: EVENT_LOG_RETENTION_SECONDS,
+    });
   } catch {}
 }
 
@@ -2801,7 +2830,12 @@ async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
 //                            last posted surface derivation — the
 //                            history-integrity baseline (§5.2 of the
 //                            design). Ids and patterns only; no state
-//                            digest is pinned.
+//                            digest is pinned. Expires after
+//                            SURFACE_MANIFEST_RETENTION_SECONDS
+//                            (30 days; see the Retention block) —
+//                            a lapsed manifest simply re-bases the
+//                            integrity check at the next posted
+//                            derivation.
 //   inflight-s:/posted-s:    the per-commit claim discipline, scoped
 //                            to the surface Check so one commit can
 //                            hold a "git.pp state" and a "git.pp
@@ -4115,7 +4149,9 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
     await env.CREDS.put(postedKey, `posted:${checkId}`, {
       expirationTtl: 86400,
     });
-    // The manifest advances only on a posted derivation.
+    // The manifest advances only on a posted derivation. It is
+    // written with the retention TTL: a manifest nobody refreshes
+    // expires, and the next posted derivation re-bases it.
     try {
       await env.CREDS.put(
         `surfmanifest:${repo}`,
@@ -4125,6 +4161,7 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
           tipSha,
           at: new Date().toISOString(),
         }),
+        { expirationTtl: SURFACE_MANIFEST_RETENTION_SECONDS },
       );
     } catch {}
     await releaseClaim();
@@ -4217,9 +4254,9 @@ export default {
     if (url.pathname === "/webhook" && request.method === "POST") {
       return webhook(request, env, ctx);
     }
-    if (url.pathname === "/events" && request.method === "GET") {
-      return events(env);
-    }
+    // No /events route: the delivery log is operator-only (M3,
+    // v0.3.0). The path falls through to the 404 below, exactly
+    // like every other unlisted path.
     return Response.json({ error: "not found" }, { status: 404 });
   },
 };

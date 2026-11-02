@@ -58,12 +58,14 @@ function tarball(files) {
 class KVStub {
   constructor() {
     this.m = new Map();
+    this.putLog = []; // { k, opts } per put — S24 pins the TTLs
   }
   async get(k) {
     return this.m.has(k) ? this.m.get(k) : null;
   }
-  async put(k, v) {
+  async put(k, v, opts) {
     this.m.set(k, String(v));
+    this.putLog.push({ k, opts });
   }
   async delete(k) {
     this.m.delete(k);
@@ -1622,6 +1624,35 @@ const TIP_TWIN = S("5");
     ["task-a", "task-b", "task-d"],
     "S6: losers are still task-a, task-b, task-d",
   );
+}
+
+// ---- S24: retention TTLs on the two formerly unexpired stores (M3, v0.3.0) ------
+// The event log (evt:) and the surface manifest (surfmanifest:) were
+// written with no expiry through the dogfood phase. Every write the
+// scenarios above performed is in the stub's put log: pin that both
+// stores now carry the 30-day retention TTL, and that the older
+// stores' TTLs (inflight 600 s, posted 24 h, surfinfo 1 h, surfdecl
+// 30 d) are unchanged.
+{
+  const puts = env.CREDS.putLog;
+  const evtPuts = puts.filter((p) => p.k.startsWith("evt:"));
+  ok(evtPuts.length > 0, "S24: scenarios wrote event-log entries");
+  ok(
+    evtPuts.every((p) => p.opts?.expirationTtl === 30 * 86400),
+    "S24: every event-log write carries the 30-day retention TTL",
+  );
+  const manPuts = puts.filter((p) => p.k.startsWith("surfmanifest:"));
+  ok(manPuts.length > 0, "S24: scenarios wrote surface manifests");
+  ok(
+    manPuts.every((p) => p.opts?.expirationTtl === 30 * 86400),
+    "S24: every surface-manifest write carries the 30-day retention TTL",
+  );
+  const ttlOf = (prefix) =>
+    puts.find((p) => p.k.startsWith(prefix))?.opts?.expirationTtl;
+  eq(ttlOf("inflight:"), 600, "S24: inflight TTL unchanged (600 s)");
+  eq(ttlOf("posted:"), 86400, "S24: posted-marker TTL unchanged (24 h)");
+  eq(ttlOf("surfinfo:"), 3600, "S24: surfinfo TTL unchanged (1 h)");
+  eq(ttlOf("surfdecl:"), 30 * 86400, "S24: surfdecl TTL unchanged (30 d)");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
