@@ -1541,6 +1541,48 @@ const TIP_TWIN = S("5");
   );
 }
 
+// ---- S23: retraction in the Mapping A report (fold law, git.pp-ng v0.2.0) ----------
+// The vendored engine carries the retraction law (Casey ruling,
+// 2026-11-02): a captain-ratified third-party accusation retracts its
+// target and the report marks it CONTESTED with provenance; the author's
+// own settlement retracts without the mark; an open dispute is listed as
+// having no effect on the state.
+{
+  const base = [
+    { id: "g", kind: "task", parents: [], author: "amy", effects: { k: 0 } },
+    { id: "c", kind: "task", parents: ["g"], author: "amy", effects: { x: "bad", k: 5 } },
+    { id: "e", kind: "task", parents: ["c"], author: "bob", effects: { k: "e-val" } },
+    { id: "d", kind: "task", parents: ["g"], author: "bob", effects: { k: "d-val" } },
+    { id: "ov", kind: "override", parents: ["g"], author: "cap", effects: { z: 1 }, reason: "standing order" },
+  ];
+  const dsp = { id: "dsp", kind: "dispute", parents: ["c"], author: "mallory", target: "c", reason: "filed in error", effects: {} };
+  const contested = api.renderReport([...base, dsp,
+    { id: "stl", kind: "settlement", parents: ["dsp"], author: "cap", dispute: "dsp", resolution: "upheld", effects: {} },
+  ], "retract-probe", {}).text;
+  ok(contested.includes("## Retractions"), "S23: report has a Retractions section");
+  ok(contested.includes("`k` = d-val"), "S23: retracted record's key flips to the standing rival");
+  ok(!contested.includes("- `x` ="), "S23: retracted record's own key leaves the state");
+  ok(
+    contested.includes("**contested**: disputed by `mallory`, settled by `cap`"),
+    "S23: ratified accusation marked contested with provenance",
+  );
+  const ownAct = api.renderReport([...base,
+    { ...dsp, author: "bob" },
+    { id: "stl", kind: "settlement", parents: ["dsp"], author: "amy", dispute: "dsp", resolution: "upheld", effects: {} },
+  ], "retract-probe", {}).text;
+  ok(
+    ownAct.includes("`k` = d-val") && ownAct.includes("## Retractions") &&
+      !ownAct.includes("contested"),
+    "S23: author's own settlement retracts and is NOT marked contested",
+  );
+  const open = api.renderReport([...base, dsp], "retract-probe", {}).text;
+  ok(
+    open.includes("`k` = e-val") && open.includes("- `x` = bad") &&
+      open.includes("dispute against `c` is open (unsettled): no effect"),
+    "S23: open dispute leaves the state untouched and says so",
+  );
+}
+
 // ---- S6: Mapping A regression on the real demo set ---------------------------------
 {
   const demoDir = `${process.env.HOME}/workspace/demo-quilt/.gitpp/records`;

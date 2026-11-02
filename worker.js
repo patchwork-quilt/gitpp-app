@@ -483,7 +483,7 @@ async function events(env) {
 // VENDORED FOLD ENGINE — DO NOT EDIT IN THIS REPO.
 //
 // Source : patchwork-quilt/git.pp-ng — src/fold.ts
-// Commit : e296feabc3008a79ea25e7b73f5534f9454a579c
+// Commit : c37ed8792db37412c615dbb1b3e00adf73e84236
 // Via    : patchwork-quilt/gitpp-action lib/fold.ts (byte-identical
 //          vendoring of the same upstream commit), transpiled to plain
 //          JS (types stripped only — no semantic edits) for the Worker.
@@ -778,7 +778,7 @@ function topological(nodes, parents) {
   const indeg = newStrMap();
   const children = newStrMap();
   for (const r of nodes) {
-    indeg[r] = parents[r].length;
+    indeg[r] = parents[r].filter((p) => nodes.has(p)).length;
     children[r] = [];
   }
   for (const r of nodes) {
@@ -928,6 +928,145 @@ function deriveLegacy(records) {
   const orphans = [...orphan].sort(cmpCodePoints);
   return { state, order, conflicts, orphans };
 }
+var META_KINDS = new Set(["dispute", "settlement"]);
+function kindOf(rec) {
+  return rec.kind;
+}
+function isMeta(rec) {
+  const k = kindOf(rec);
+  return typeof k === "string" && META_KINDS.has(k);
+}
+function authorOf(rec) {
+  const a = rec.author;
+  return typeof a === "string" && a !== "" ? a : null;
+}
+function settlementPass(idx, orphan) {
+  const kind = newStrMap();
+  const author = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    kind[rid] = kindOf(idx[rid]);
+    author[rid] = authorOf(idx[rid]);
+  }
+  const captains = new Set;
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "override" && !orphan.has(rid) && author[rid]) {
+      captains.add(author[rid]);
+    }
+  }
+  const targetOf = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "dispute")
+      continue;
+    const rec = idx[rid];
+    if (typeof rec.target === "string" && Object.prototype.hasOwnProperty.call(idx, rec.target) && typeof rec.reason === "string" && rec.reason !== "") {
+      targetOf[rid] = rec.target;
+    }
+  }
+  const live = new Set(Object.keys(targetOf).filter((d) => !orphan.has(d)));
+  const settlementsOn = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] !== "settlement" || orphan.has(rid) || !author[rid]) {
+      continue;
+    }
+    const rec = idx[rid];
+    const d = rec.dispute;
+    if (typeof d !== "string" || !Object.prototype.hasOwnProperty.call(targetOf, d)) {
+      continue;
+    }
+    if (rec.resolution !== "upheld" && rec.resolution !== "rejected") {
+      continue;
+    }
+    const tgtAuthor = author[targetOf[d]];
+    if (author[rid] === tgtAuthor || captains.has(author[rid])) {
+      if (!settlementsOn[d])
+        settlementsOn[d] = [];
+      settlementsOn[d].push(rid);
+    }
+  }
+  const depMap = newStrMap();
+  for (const d of live) {
+    const out = new Set;
+    for (const d2 of live) {
+      if (targetOf[d2] === d || (settlementsOn[d] ?? []).includes(targetOf[d2])) {
+        out.add(d2);
+      }
+    }
+    depMap[d] = out;
+  }
+  const isVoided = (x, status) => {
+    for (const d2 of live) {
+      if (targetOf[d2] === x && status[d2] === "upheld")
+        return true;
+    }
+    return false;
+  };
+  const status = newStrMap();
+  const rulingOf = newStrMap();
+  const remaining = new Set(live);
+  for (;; ) {
+    const ready = [...remaining].filter((d) => [...depMap[d]].every((x) => Object.prototype.hasOwnProperty.call(status, x))).sort(cmpCodePoints);
+    if (ready.length === 0)
+      break;
+    for (const d of ready) {
+      if (isVoided(d, status)) {
+        status[d] = "inert";
+      } else {
+        const cands = (settlementsOn[d] ?? []).filter((s) => !isVoided(s, status));
+        if (cands.length === 0) {
+          status[d] = "open";
+        } else {
+          const ruling = [...cands].sort(cmpCodePoints)[0];
+          rulingOf[d] = ruling;
+          status[d] = String(idx[ruling].resolution);
+        }
+      }
+      remaining.delete(d);
+    }
+  }
+  const statuses = newStrMap();
+  for (const rid of Object.keys(idx)) {
+    if (kind[rid] === "dispute")
+      statuses[rid] = status[rid] ?? "inert";
+  }
+  const retracted = new Set;
+  for (const d of live) {
+    if (status[d] === "upheld" && !META_KINDS.has(String(kind[targetOf[d]]))) {
+      retracted.add(targetOf[d]);
+    }
+  }
+  const contested = [];
+  for (const d of live) {
+    if (status[d] !== "upheld")
+      continue;
+    const t = targetOf[d];
+    if (META_KINDS.has(String(kind[t])))
+      continue;
+    const tAuthor = author[t];
+    if (tAuthor === null)
+      continue;
+    const s = rulingOf[d];
+    if (author[d] !== tAuthor && author[s] !== tAuthor) {
+      contested.push({
+        record: t,
+        dispute: d,
+        settlement: s,
+        disputed_by: author[d],
+        settled_by: author[s]
+      });
+    }
+  }
+  contested.sort((a, b) => cmpCodePoints(a.record, b.record) || cmpCodePoints(a.dispute, b.dispute));
+  return { retracted, statuses, contested };
+}
+function retractionStatus(records) {
+  const { idx, orphan } = prepareDerive(records);
+  const { retracted, statuses, contested } = settlementPass(idx, orphan);
+  return {
+    disputes: statuses,
+    retracted: [...retracted].sort(cmpCodePoints),
+    contested
+  };
+}
 function prepareDerive(records) {
   const idx = indexRecords([...records]);
   const ids = new Set(Object.keys(idx));
@@ -969,13 +1108,20 @@ function prepareDerive(records) {
       nonOrphan.add(rid);
   for (const rid of cycleAffected(nonOrphan, parents))
     orphan.add(rid);
+  const { retracted } = settlementPass(idx, orphan);
   const applied = [];
-  for (const rid of ids)
-    if (!orphan.has(rid))
+  for (const rid of ids) {
+    if (!orphan.has(rid) && !isMeta(idx[rid]))
       applied.push(rid);
+  }
   applied.sort(cmpCodePoints);
   const order = topological(new Set(applied), parents);
-  return { idx, parents, applied, order, orphan };
+  const landed = [];
+  for (const rid of ids)
+    if (!orphan.has(rid))
+      landed.push(rid);
+  const landedOrder = topological(new Set(landed), parents);
+  return { idx, parents, applied, order, orphan, retracted, landedOrder };
 }
 var POP8 = new Uint8Array(256);
 for (let i = 1;i < 256; i++)
@@ -983,7 +1129,7 @@ for (let i = 1;i < 256; i++)
 function popcount32(x) {
   return POP8[x & 255] + POP8[x >>> 8 & 255] + POP8[x >>> 16 & 255] + POP8[x >>> 24];
 }
-function buildAncestry(order, parents, idx) {
+function buildAncestry(order, parents, idx, tallyExclude) {
   const n = order.length;
   const words = Math.ceil(n / 32);
   const bits = new Uint32Array(n * words);
@@ -992,6 +1138,8 @@ function buildAncestry(order, parents, idx) {
   const witnessMask = new Uint32Array(words);
   for (let i = 0;i < n; i++) {
     pos.set(order[i], i);
+    if (tallyExclude && tallyExclude.has(order[i]))
+      continue;
     const r = rankOf(idx[order[i]]);
     if (r < WITNESS_RANK)
       intentMask[i >> 5] |= 1 << (i & 31);
@@ -1027,10 +1175,17 @@ function rowPopcount(anc, row) {
   return s;
 }
 function derive(records) {
-  const { idx, parents, applied, order, orphan } = prepareDerive(records);
-  const anc = buildAncestry(order, parents, idx);
+  const { idx, parents, applied, order, orphan, retracted, landedOrder } = prepareDerive(records);
+  const tallyExclude = new Set;
+  for (const rid of landedOrder) {
+    if (isMeta(idx[rid]) || retracted.has(rid))
+      tallyExclude.add(rid);
+  }
+  const anc = buildAncestry(landedOrder, parents, idx, tallyExclude);
   const setters = newStrMap();
   for (const rid of applied) {
+    if (retracted.has(rid))
+      continue;
     for (const k of Object.keys(effectsOf(idx[rid]))) {
       if (!setters[k])
         setters[k] = new Set;
@@ -1353,18 +1508,19 @@ function buildFrontierCheckpoint(records, frontierIds) {
     parents[rid] = parentsOf(idx[rid]);
   let members;
   if (frontierIds === undefined) {
-    const applied = derive(records).order;
-    if (applied.length === 0)
+    const prep = prepareDerive(records);
+    if (prep.order.length === 0)
       return null;
-    const appliedSet = new Set(applied);
-    const hasAppliedChild = new Set;
-    for (const rid of applied) {
+    const landed = Object.keys(idx).filter((rid) => !prep.orphan.has(rid));
+    const landedSet = new Set(landed);
+    const hasLandedChild = new Set;
+    for (const rid of landed) {
       for (const p of parents[rid]) {
-        if (appliedSet.has(p))
-          hasAppliedChild.add(p);
+        if (landedSet.has(p))
+          hasLandedChild.add(p);
       }
     }
-    members = applied.filter((r) => !hasAppliedChild.has(r)).sort(cmpCodePoints);
+    members = landed.filter((r) => !hasLandedChild.has(r)).sort(cmpCodePoints);
   } else {
     const norm = frontierMembers(frontierIds);
     if (norm === null)
@@ -1481,6 +1637,7 @@ function witnessFreshness(records) {
   return result;
 }
 
+
 // ==== END VENDORED FOLD ENGINE ====
 
 // ============================================================================
@@ -1524,7 +1681,13 @@ function fmtValue(v) {
   return typeof v === "string" ? v : JSON.stringify(v);
 }
 
-function kindOf(rec) {
+// Named displayKind, NOT kindOf: the vendored fold engine above declares
+// its own kindOf (raw kind value) in this same module scope, and the two
+// must not collide — a duplicate declaration is a SyntaxError in module
+// code (found at the git.pp-ng v0.2.0 re-vendor, 2026-11-02). This one is
+// the app layer's display helper: the kind as shown in reports, with
+// "witness" for records whose kind is missing or not a string.
+function displayKind(rec) {
   return typeof rec?.kind === "string" ? rec.kind : "witness";
 }
 
@@ -1571,7 +1734,7 @@ function tieBreakCounts(id, byId, ancCache) {
  * tie-break with both candidates' measured values). */
 function explainConflict(conflict, byId) {
   const winner = byId.get(conflict.winner);
-  const wKind = kindOf(winner);
+  const wKind = displayKind(winner);
   const ancCache = new Map();
   const winnerInfo = tieBreakCounts(conflict.winner, byId, ancCache);
   const wRank = rankOf(winner);
@@ -1587,7 +1750,7 @@ function explainConflict(conflict, byId) {
   );
   for (const loserId of conflict.losers) {
     const loser = byId.get(loserId);
-    const lKind = kindOf(loser);
+    const lKind = displayKind(loser);
     let why;
     if (rankOf(loser) > wRank) {
       why = `outranked — ${wKind} beats ${lKind} (kind priority is absolute)`;
@@ -1671,11 +1834,61 @@ function renderReport(records, project, opts = {}) {
     .map((key) => `- \`${key}\` = ${fmtValue(out.state[key])}`);
   const conflictBlocks = out.conflicts.map((c) => explainConflict(c, byId));
   const orphanLines = out.orphans.map((o) => `- \`${o}\``);
+  // Retractions (fold law, git.pp-ng v0.2.0): same wording as the
+  // Action's report — one product voice. Every claim here is one the
+  // records prove: the retracted set and the contested markings come
+  // from the engine's retraction surface; the dispute named on a plain
+  // line is read off the records themselves. A retraction the target's
+  // author neither filed nor settled is marked CONTESTED, with
+  // provenance — never a silent void (Casey's ruling, 2026-11-02: say
+  // only what the records can back up).
+  const ret = retractionStatus(records);
+  const retractionLines = [];
+  {
+    const contestedByPair = new Map(
+      ret.contested.map((c) => [`${c.record}\n${c.dispute}`, c]),
+    );
+    for (const rid of ret.retracted) {
+      const upheld = records.filter(
+        (r) => kindOf(r) === "dispute" && String(r.target) === rid &&
+          ret.disputes[String(r.id)] === "upheld",
+      );
+      for (const d of upheld) {
+        const c = contestedByPair.get(`${rid}\n${String(d.id)}`);
+        if (c) {
+          retractionLines.push(
+            `- \`${rid}\` — retracted: effects voided by upheld dispute ` +
+            `\`${c.dispute}\` (settlement \`${c.settlement}\`) — ` +
+            `**contested**: disputed by ` +
+            (c.disputed_by
+              ? `\`${c.disputed_by}\``
+              : "an author the dispute does not name") +
+            `, settled by \`${c.settled_by}\`; the author of \`${rid}\` ` +
+            `neither filed nor settled it`,
+          );
+        } else {
+          retractionLines.push(
+            `- \`${rid}\` — retracted: effects voided by upheld dispute ` +
+            `\`${String(d.id)}\``,
+          );
+        }
+      }
+    }
+    for (const [did, status] of Object.entries(ret.disputes)) {
+      if (status !== "open") continue;
+      const d = byId.get(did);
+      retractionLines.push(
+        `- \`${did}\` — dispute against \`${String(d?.target)}\` is open ` +
+        `(unsettled): no effect on the state above`,
+      );
+    }
+  }
 
   let dropRejects = 0;
   let dropState = 0;
   let dropConflicts = 0;
   let dropOrphans = 0;
+  let dropRetractions = 0;
   const build = () => {
     const lines = [...head];
     if (rejectLines.length > 0) {
@@ -1704,6 +1917,14 @@ function renderReport(records, project, opts = {}) {
       lines.push("", "## Orphans (excluded from state)", "", keptOrphans.join("\n"));
       if (dropOrphans > 0) lines.push(TRUNC_MARKER(dropOrphans));
     }
+    const keptRetractions = retractionLines.slice(
+      0,
+      retractionLines.length - dropRetractions,
+    );
+    if (retractionLines.length > 0) {
+      lines.push("", "## Retractions", "", ...keptRetractions);
+      if (dropRetractions > 0) lines.push(TRUNC_MARKER(dropRetractions));
+    }
     lines.push("", `> ${A_QUALIFICATIONS}`);
     return lines.join("\n") + "\n";
   };
@@ -1722,6 +1943,12 @@ function renderReport(records, project, opts = {}) {
   }
   while (textBytes(text) > MAX_TEXT && dropOrphans < orphanLines.length) {
     dropOrphans++;
+    text = build();
+  }
+  // Retraction lines are dropped last: they are few, and they are the
+  // section a reader most needs not to lose silently.
+  while (textBytes(text) > MAX_TEXT && dropRetractions < retractionLines.length) {
+    dropRetractions++;
     text = build();
   }
   return { text, out, title, summary: scope };
@@ -2836,7 +3063,7 @@ function surfaceStateLines(surface, out, records) {
     return { id: wid, rec: byId.get(wid) };
   };
   const winText = (w) =>
-    `winner \`${w.id}\` (${kindOf(w.rec)}` +
+    `winner \`${w.id}\` (${displayKind(w.rec)}` +
     (w.rec?.reason ? `, reason: "${w.rec.reason}"` : "") +
     ")";
   const lines = [];

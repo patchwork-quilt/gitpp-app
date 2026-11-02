@@ -4,6 +4,32 @@ All notable changes to gitpp-app. Versions name this repository's
 mainline; a version is tagged only when the tagged tree is the
 deployed Worker (see the 0.1.0 note).
 
+## [0.2.0] — 2026-11-02
+
+Retraction is fold law in the vendored engine (git.pp-ng v0.2.0, Casey
+ruling 2026-11-02).
+
+- Engine re-vendored from git.pp-ng `src/fold.ts` at `c37ed87`
+  (v0.2.0), via gitpp-action's `lib/fold.ts`, transpiled by the same
+  recipe as the previous vendoring (bun build + three mechanical
+  rewrites; the recipe was first re-proven byte-identical against the
+  previous vendored body). Dispute + settlement records now fold: an
+  authoritative settlement upholding a dispute voids the target
+  record's effects; unattributed record sets are dispute-inert, so
+  existing projects derive exactly as before.
+- The state Check gains a **Retractions** section (the same wording as
+  the Action's report): retracted records named with the upheld dispute
+  that voided them; a ratified accusation the record's author neither
+  filed nor settled is marked **contested**, with dispute/settlement
+  provenance; open disputes are listed as having no effect on the
+  state. In the byte-budget cascade the section is dropped last.
+- App-layer display helper renamed `kindOf` → `displayKind`: the
+  v0.2.0 engine declares its own `kindOf` in the same module scope, and
+  a duplicate declaration is a SyntaxError in module code. (Caught by
+  the surface suite before deploy, not in production.)
+- Tests: 144 assertions (was 138) — S23 pins the contested marking, the
+  unmarked self-retraction, and the inert open dispute.
+
 ## [0.1.0] — 2026-11-02
 
 The first versioned line: the registered App, the derivation loop,
