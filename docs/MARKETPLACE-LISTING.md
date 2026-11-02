@@ -39,11 +39,11 @@
 > ### Losers are never deleted
 > Every claim stays in the record and in the report. An authoritative dispute settlement can void a record's effects (fold law, git.pp-ng v0.2.0); a ratified accusation its author still stands behind is marked **contested**, not hidden.
 >
-> ### Read-only, advisory, yours
+> ### Advisory only — it never writes to your repo
 > Three permissions — Metadata read, Contents read, Checks write — and the app never writes to a repository. The records live in your repo as plain git, the spec is open, uninstall is immediate, and stored data expires within 30 days.
 >
 > ### Proven in the open
-> Live-day test 10/10: five agents, referee-chosen merge order, every Check matched an independent fold. Legibility 94.4% with cold readers. One fold, three independent ports, 1,155 conformance cases.
+> Live-day test 10/10: five agents, referee-chosen merge order, every Check matched an independent fold. Legibility 94.4% with cold readers. One fold, 1,155 conformance cases pinning the ports that ship.
 
 (962 characters including headings, counted as typed.)
 
@@ -57,24 +57,28 @@
   values, and losers from the Check text, re-measured after the
   first pass's 88.9% miss and its fixes.
   Record: `docs/evidence/legibility.md`.
-- **1,155-case conformance** — one corpus, three independent
-  ports (TypeScript, Python, Elixir) byte-identical; includes the
+- **1,155-case conformance** — one corpus pinning the fold's
+  TypeScript and Python ports byte-identically, including the
   retraction law (dispute + settlement, contested marking)
-  shipped in git.pp-ng v0.2.0 and vendored here at v0.2.0.
+  shipped in git.pp-ng v0.2.0 and vendored here at v0.2.0. (The
+  Elixir/beam port is a pre-law conformance spike and does not
+  yet carry the retraction law — declared in the project
+  DECISIONS.md, not hidden.)
 - **Scale, stated at its measured width**: derivation exact at
   312 records; Check latency flat ~4–5 s to 300 records
   (project record, 2026-10-22). Nothing larger is claimed.
 
 ## Assets — required, with status
 
-The repository currently holds **no image assets**; all three
-asset classes must be produced before submission. Dimensions are
-GitHub's published specifications.
+Two of the three asset classes are now produced (drafts for the
+publisher's eye, in `docs/marketplace-assets/`); the screenshots
+remain to be captured. Dimensions are GitHub's published
+specifications.
 
 | Asset | Specification | Status | Subject / source |
 |---|---|---|---|
-| Logo | ≥200×200 px, square/centered, transparent background recommended, avoid text (shown in a circular badge) | **NEEDS PRODUCING** | A quilt/patch mark in the org's existing visual language; no text |
-| Feature card | 965×482 px custom background | **NEEDS PRODUCING** | The `git.pp state` Check answering a two-agent claim: winner, loser, deciding rule |
+| Logo | ≥200×200 px, square/centered, transparent background recommended, avoid text (shown in a circular badge) | **PRODUCED** — `docs/marketplace-assets/logo-800.png` (800×800, transparent) | A quilt/patch mark in the org's existing visual language; no text |
+| Feature card | 965×482 px custom background | **PRODUCED** — `docs/marketplace-assets/feature-card-965x482.png` (exact size) | The `git.pp state` Check answering a two-agent claim: winner, loser, deciding rule |
 | Screenshots (up to 5, all same dimensions) | ≥1200 px wide, UI only, no browser chrome, short captions each | **NEEDS PRODUCING** | (1) A real `git.pp state` Check on SuperInstance/gitpp-demo-quilt; (2) a `git.pp surface` Check on patchwork-quilt/gitpp-dogfood-b1, including a named vanished record; (3) a Check showing a **contested** retraction; (4) the landing page's permission table; (5) the record files themselves under `.gitpp/records/` |
 
 ## The eight trust requirements (github-road.md §4) — status
