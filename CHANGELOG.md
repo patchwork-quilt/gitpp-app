@@ -27,6 +27,11 @@ ruling 2026-11-02).
   v0.2.0 engine declares its own `kindOf` in the same module scope, and
   a duplicate declaration is a SyntaxError in module code. (Caught by
   the surface suite before deploy, not in production.)
+- The STATE-ONLY ruling (same packet: closure differences stay
+  informational) is noted in an app-layer comment at the vendored
+  block's boundary — the transpile strips comments, so the ruling
+  comment itself lives at the decision point in git.pp-ng's two ports
+  and in gitpp-action's comment-preserving vendoring.
 - Tests: 144 assertions (was 138) — S23 pins the contested marking, the
   unmarked self-retraction, and the inert open dispute.
 

@@ -1640,6 +1640,21 @@ function witnessFreshness(records) {
 
 // ==== END VENDORED FOLD ENGINE ====
 
+// ---------------------------------------------------------------------------
+// NOTE for re-vendorers (app layer — not part of the vendored engine):
+// the vendored transpile strips comments, so the fold's ruling comments
+// do not survive into the block above. One of them governs a verdict
+// this Worker serves: STATE-ONLY stands (Casey, 2026-11-02) — in the
+// vendored verifyCheckpoint, when the state matches but the closure
+// root does not, the verdict is STATE-ONLY: the difference is reported
+// as state, never accused as MISMATCH, because a root proves
+// difference, not substitution. The full ruling comment, with
+// tailor-fit guidance (what pinning MISMATCH instead would require),
+// sits at that return in git.pp-ng's src/fold.ts and referee/fold.py.
+// Do not change the verdict in this file without changing it there
+// first — this copy is refreshed by re-vendoring, never local edits.
+// ---------------------------------------------------------------------------
+
 // ============================================================================
 // DERIVATION LOOP — the app answers.
 //
