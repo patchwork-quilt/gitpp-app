@@ -61,9 +61,8 @@
   TypeScript and Python ports byte-identically, including the
   retraction law (dispute + settlement, contested marking)
   shipped in git.pp-ng v0.2.0 and vendored here at v0.2.0. (The
-  Elixir/beam port is a pre-law conformance spike and does not
-  yet carry the retraction law — declared in the project
-  DECISIONS.md, not hidden.)
+  Elixir/beam port is at the same law since gitpp-beam v0.1.0 —
+  a conformance spike at parity, not a production read path.)
 - **Scale, stated at its measured width**: derivation exact at
   312 records; Check latency flat ~4–5 s to 300 records
   (project record, 2026-10-22). Nothing larger is claimed.
