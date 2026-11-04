@@ -1662,6 +1662,251 @@ function witnessFreshness(records) {
 // ---------------------------------------------------------------------------
 
 // ============================================================================
+// DERIVATION ATTESTATION — the record gets signed.
+//
+// git.pp's record was not signed; a competitor family (signed agent
+// attribution tools) makes that gap visible. This is the answer, in the
+// narrowest form that is still true: every derivation the App posts
+// carries a cryptographic attestation over what it derived.
+//
+// WHAT IS SIGNED. One canonical string, five lines, UTF-8, no trailing
+// newline:
+//
+//   git.pp/attestation/v1
+//   app: <the App's id>
+//   head: <the head commit SHA the Check is posted on>
+//   records: <digest of the exact record set the fold consumed>
+//   report: <digest of the report the Check carries>
+//
+// Ed25519, over WebCrypto (Cloudflare Workers). The signature is
+// base64 in the Check's `## Attestation` section, next to the key id
+// (the first 8 hex chars of the public key's SHA-256) and the two
+// digests.
+//
+// THE TWO DIGESTS. The records digest is the vendored engine's OWN
+// input digest — checkpointRoot()'s construction, over the landed set
+// (the records the fold consumed: orphans never fold, so they are not
+// in it), each record contributing `<id>:<recordLeaf()>` with the ids
+// in code-point order. We do not invent a second digest for the same
+// job, and we do not touch the vendored bytes to get it: the harness
+// pins attestationRecordsDigest() to checkpointRoot()'s value. The
+// report digest is sha256Hex() over the report text as posted, minus
+// the attestation section itself.
+//
+// KEY CUSTODY. The private key is the Worker secret ATTESTATION_KEY
+// (base64 PKCS#8); it is never written to the repo, never logged, and
+// never leaves the Worker. The public key (ATTESTATION_PUBLIC_KEY,
+// base64 of the raw 32-byte key) is published in docs/attestation-key.pub
+// and names the key in the Check as a key id.
+//
+// WHAT AN ATTESTATION PROVES, EXACTLY: that the holder of this key
+// produced this derivation over these inputs. It does NOT prove who
+// authored the individual records, that the records are true, or that
+// the fold is correct — the Check's own qualifications say so ("Digests
+// authenticate content, not authorship"), and docs/SIGNING.md says it
+// at length.
+//
+// WITHOUT THE SECRET, NOTHING HERE RUNS: the Check is byte-identical
+// to the unsigned report, byte for byte.
+// ============================================================================
+
+const ATTESTATION_FORMAT = "git.pp/attestation/v1";
+
+/** The canonical attestation string: five lines, UTF-8, no trailing
+ *  newline. This exact form is what the signature covers and what
+ *  scripts/verify-attestation.mjs rebuilds. */
+function attestationString({ appId, head, records, report }) {
+  return [
+    ATTESTATION_FORMAT,
+    `app: ${appId}`,
+    `head: ${head}`,
+    `records: ${records}`,
+    `report: ${report}`,
+  ].join("\n");
+}
+
+/** The records digest: the vendored engine's own input digest over the
+ *  records the fold consumed. checkpointRoot() builds exactly this —
+ *  the ancestor closure of the landed frontier, sorted by id, one
+ *  `<id>:<recordLeaf()>` line each, hashed with sha256Hex() — and the
+ *  closure of the landed frontier IS the landed set (every landed
+ *  record is an ancestor of some maximal landed record), so we
+ *  reproduce that value over the same ids without re-running the fold
+ *  a second time. `orphanIds` is the fold's own orphan set (the
+ *  records that never folded); the harness pins this function's value
+ *  against buildFrontierCheckpoint().closureRoot. */
+function attestationRecordsDigest(records, orphanIds) {
+  const idx = indexRecords([...records]);
+  const orphans = new Set(orphanIds ?? []);
+  const ids = Object.keys(idx)
+    .filter((id) => !orphans.has(id))
+    .sort(cmpCodePoints);
+  return sha256Hex(ids.map((id) => `${id}:${recordLeaf(idx[id])}`).join("\n"));
+}
+
+/** The `## Attestation` section's lines. Short on purpose: the key id,
+ *  the two digests and the signature — plus the app id and the head
+ *  commit, because a receipt that does not say what it attests to is
+ *  not a receipt. */
+function attestationSectionLines(att) {
+  return [
+    "## Attestation",
+    "",
+    `- app id: \`${att.appId}\``,
+    `- head: \`${att.head}\``,
+    `- key id: \`${att.keyId}\``,
+    `- records: \`${att.recordsDigest}\``,
+    `- report: \`${att.reportDigest}\``,
+    `- signature: \`${att.signature}\``,
+  ];
+}
+
+/** Insert the attestation section into a rendered report, directly above
+ *  the closing qualifications blockquote: the qualifications are the
+ *  Check's last text (renderReport's contract — "the qualifications
+ *  blockquote is always the final text"), so the receipt goes just
+ *  above the caveat, not after it. */
+function insertAttestationSection(text, sectionLines) {
+  const section = "\n" + sectionLines.join("\n") + "\n";
+  const at = text.lastIndexOf("\n> ");
+  if (at < 0) return text + section;
+  return text.slice(0, at) + section + text.slice(at);
+}
+
+/** Base64 -> bytes, and bytes -> base64. The Worker's own btoa/atob
+ *  are available; the secret and the signature are both base64. */
+function b64Bytes(b64) {
+  const bin = atob(String(b64).trim());
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesB64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+/** The key id: the first 8 hex chars of the public key's SHA-256. */
+async function attestationKeyId(rawPublicKey) {
+  const digest = await crypto.subtle.digest("SHA-256", rawPublicKey);
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 8);
+}
+
+/** Load the signing key pair from the environment. Returns null when
+ *  no signing secret is configured (the ordinary case: no section, no
+ *  errors, a byte-identical report), or {error} when one IS configured
+ *  but unusable — a half-configured key must never sign, because an
+ *  unverifiable receipt is worse than no receipt. The public key is
+ *  checked against the private one by signing a probe and verifying
+ *  it: a mismatched pair (a deploy slip) would otherwise publish a key
+ *  id that no signature verifies under. */
+async function attestationKeyPair(env) {
+  const secret = env?.ATTESTATION_KEY;
+  if (!secret || typeof secret !== "string" || !secret.trim())
+    return null;
+  const publicKey = env?.ATTESTATION_PUBLIC_KEY;
+  if (!publicKey || typeof publicKey !== "string" || !publicKey.trim())
+    return { error: "no ATTESTATION_PUBLIC_KEY — a signing key without its public key cannot be named" };
+  try {
+    const pkcs8 = b64Bytes(secret);
+    const raw = b64Bytes(publicKey);
+    if (raw.length !== 32)
+      return { error: `ATTESTATION_PUBLIC_KEY is ${raw.length} bytes, not the 32 of an Ed25519 key` };
+    const key = await crypto.subtle.importKey(
+      "pkcs8",
+      pkcs8,
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    const pub = await crypto.subtle.importKey(
+      "raw",
+      raw,
+      { name: "Ed25519" },
+      false,
+      ["verify"],
+    );
+    const probe = new TextEncoder().encode(ATTESTATION_FORMAT);
+    const probeSig = await crypto.subtle.sign({ name: "Ed25519" }, key, probe);
+    const matched = await crypto.subtle.verify(
+      { name: "Ed25519" },
+      pub,
+      probeSig,
+      probe,
+    );
+    if (!matched)
+      return { error: "ATTESTATION_PUBLIC_KEY does not match ATTESTATION_KEY — refusing to sign under a key id nobody can verify" };
+    return { key, keyId: await attestationKeyId(raw) };
+  } catch (err) {
+    return { error: `signing key unusable: ${err?.message ?? err}` };
+  }
+}
+
+/** Build the attestation for one rendered report. Returns null when
+ *  signing is not configured; {error} when it is configured but broken
+ *  (the caller logs that — never silent). */
+async function buildAttestation(env, app, { head, records, orphanIds, reportText }) {
+  const pair = await attestationKeyPair(env);
+  if (!pair) return null;
+  if (pair.error) return { error: pair.error };
+  const appId = String(app?.id ?? app?.slug ?? "unknown");
+  const recordsDigest = attestationRecordsDigest(records, orphanIds);
+  const reportDigest = sha256Hex(reportText);
+  const string = attestationString({
+    appId,
+    head,
+    records: recordsDigest,
+    report: reportDigest,
+  });
+  const sig = await crypto.subtle.sign(
+    { name: "Ed25519" },
+    pair.key,
+    new TextEncoder().encode(string),
+  );
+  return {
+    appId,
+    head,
+    keyId: pair.keyId,
+    recordsDigest,
+    reportDigest,
+    signature: bytesB64(new Uint8Array(sig)),
+    string,
+  };
+}
+
+/** Attach the attestation to a rendered report.
+ *
+ *  THE BYTE BUDGET. The section is a receipt, not the payload: when it
+ *  does not fit under the 65,000-byte budget the SECTION goes, whole,
+ *  and the Check is the unsigned report — the report's content is never
+ *  sacrificed to keep the receipt. (The alternative — reserving room
+ *  for the section and truncating the state list to fit it — is the
+ *  other defensible ruling; this one keeps the report byte-identical
+ *  to the unsigned one, so the report digest means the same thing
+ *  whether or not signing is on. A dropped section is never partially
+ *  present: a verifier either finds a whole section or none.) */
+async function attachAttestation(env, app, { head, records, orphanIds, reportText }) {
+  const att = await buildAttestation(env, app, {
+    head,
+    records,
+    orphanIds,
+    reportText,
+  });
+  if (!att) return { text: reportText };
+  if (att.error) return { text: reportText, error: att.error };
+  const withSection = insertAttestationSection(
+    reportText,
+    attestationSectionLines(att),
+  );
+  if (textBytes(withSection) > MAX_TEXT) return { text: reportText };
+  return { text: withSection, attestation: att };
+}
+
+// ============================================================================
 // DERIVATION LOOP — the app answers.
 //
 // On a verified push / check_suite (requested|rerequested) event, behind
@@ -2735,10 +2980,24 @@ async function deriveAndPost(env, app, { repo, sha, installationId }, shared) {
     stage = "render";
     const projectName =
       (typeof project?.project === "string" && project.project) || repo;
-    const { text, title, summary } = renderReport(records, projectName, {
+    const rendered = renderReport(records, projectName, {
       sha,
       rejects,
     });
+    // Sign the record (the attestation section rides on the report;
+    // with no signing secret the text is the unsigned report, byte for
+    // byte). A half-configured key is logged, never signed under.
+    const attested = await attachAttestation(env, app, {
+      head: sha,
+      records,
+      orphanIds: rendered.out.orphans,
+      reportText: rendered.text,
+    });
+    if (attested.error) {
+      await log("attestation-misconfigured", attested.error);
+    }
+    const { title, summary } = rendered;
+    const text = attested.text;
     stage = "post";
     const existing = await existingCheckId(token, repo, sha).catch(() => null);
     if (existing) {
@@ -4092,7 +4351,7 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
       if (gone.length > 0) vanished = { ids: gone, at: manifest.at ?? null };
     }
     stage = "render";
-    const { text, title, summary } = renderSurfaceReport({
+    const rendered = renderSurfaceReport({
       surface,
       mode,
       sha,
@@ -4109,6 +4368,21 @@ async function deriveSurfaceAndPost(env, app, args, shared) {
         mode === "preview" ? { gate: propGate, union } : null,
       vanished,
     });
+    // Sign the record. The surface path folds the landed records (plus
+    // the proposals, in a preview), so the records digest covers
+    // exactly what those derivations consumed.
+    const attested = await attachAttestation(env, app, {
+      head: sha,
+      records: mode === "preview" ? union.records : landedGate.kept,
+      orphanIds:
+        mode === "preview" ? union.out.orphans : landedOut.orphans,
+      reportText: rendered.text,
+    });
+    if (attested.error) {
+      await log("attestation-misconfigured", attested.error);
+    }
+    const { title, summary } = rendered;
+    const text = attested.text;
     stage = "post";
     const existing = await existingCheckId(
       token,

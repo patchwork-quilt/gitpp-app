@@ -5,10 +5,24 @@
 // with fetch and KV stubbed, then driven through maybeDerive with
 // synthetic webhook payloads, exactly as the live webhook drives it.
 // No network, no Cloudflare. Run: bun surface.test.mjs
-import { readFileSync, writeFileSync, readdirSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { generateKeyPairSync } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  verify as cryptoVerify,
+} from "node:crypto";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 // ---- extract the worker core ----------------------------------------------
 const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8");
@@ -21,7 +35,7 @@ const slicePath = `${tmpdir()}/gitpp-surface-slice-${process.pid}.mjs`;
 writeFileSync(
   slicePath,
   src.slice(start, end) +
-    "\n;globalThis.__api = { maybeDerive, derive, renderReport, gateRecordFile, validateSurface, surfaceDeclares, applyDeclarationGate, pickWinnerId, renderSurfaceReport, findDuplicateDeclarationKey, writeSurfinfo };\n",
+    "\n;globalThis.__api = { maybeDerive, derive, renderReport, gateRecordFile, validateSurface, surfaceDeclares, applyDeclarationGate, pickWinnerId, renderSurfaceReport, findDuplicateDeclarationKey, writeSurfinfo, buildFrontierCheckpoint };\n",
 );
 await import(slicePath);
 const api = globalThis.__api;
@@ -58,14 +72,14 @@ function tarball(files) {
 class KVStub {
   constructor() {
     this.m = new Map();
-    this.putLog = []; // { k, opts } per put — S24 pins the TTLs
+    this.putLog = []; // { k, v, opts } per put — S24 pins the TTLs
   }
   async get(k) {
     return this.m.has(k) ? this.m.get(k) : null;
   }
   async put(k, v, opts) {
     this.m.set(k, String(v));
-    this.putLog.push({ k, opts });
+    this.putLog.push({ k, v: String(v), opts });
   }
   async delete(k) {
     this.m.delete(k);
@@ -145,8 +159,8 @@ const app = {
 };
 const env = { CREDS: new KVStub() };
 
-async function push(repo, ref, after, timestamp) {
-  await api.maybeDerive(env, {}, app, "push", {
+async function push(repo, ref, after, timestamp, envX = env) {
+  await api.maybeDerive(envX, {}, app, "push", {
     ref,
     after,
     head_commit: { timestamp: timestamp ?? "2026-10-22T18:00:00Z" },
@@ -1653,6 +1667,364 @@ const TIP_TWIN = S("5");
   eq(ttlOf("posted:"), 86400, "S24: posted-marker TTL unchanged (24 h)");
   eq(ttlOf("surfinfo:"), 3600, "S24: surfinfo TTL unchanged (1 h)");
   eq(ttlOf("surfdecl:"), 30 * 86400, "S24: surfdecl TTL unchanged (30 d)");
+}
+
+// ---- S25: derivation attestation — the record gets signed ----------------------
+// With a signing key in the environment the Worker signs a canonical
+// attestation string over (app id, head sha, records digest, report
+// digest) and appends an `## Attestation` section to the Check. With no
+// signing key the report is byte-identical to the unsigned one. The
+// keypair here is a throwaway made inside this harness; it is not the
+// operator's key and never leaves the harness.
+const attKeys = generateKeyPairSync("ed25519");
+const attPrivB64 = attKeys.privateKey
+  .export({ type: "pkcs8", format: "der" })
+  .toString("base64");
+const attPubRaw = attKeys.publicKey
+  .export({ type: "spki", format: "der" })
+  .subarray(12); // Ed25519 SPKI: a 12-byte header, then the 32-byte key
+const attEnv = {
+  CREDS: new KVStub(),
+  ATTESTATION_KEY: attPrivB64,
+  ATTESTATION_PUBLIC_KEY: attPubRaw.toString("base64"),
+};
+const plainEnv = { CREDS: new KVStub() };
+
+/** The attestation section as the Check carries it, minus the section
+ *  itself — the rule a verifier uses to recover the signed body. */
+function stripAttestation(text) {
+  const i = text.lastIndexOf("\n## Attestation\n");
+  if (i < 0) return text;
+  const j = text.indexOf("\n> ", i);
+  if (j < 0) return text.slice(0, i);
+  return text.slice(0, i) + text.slice(j);
+}
+
+const ATTREPO = "acme/ferry-att";
+const AT1 = "c3".repeat(20);
+const ATT_FILES = {
+  ".gitpp/project.json": J({ project: "attested" }),
+  ".gitpp/records/genesis.json": J({
+    id: "genesis",
+    kind: "witness",
+    parents: [],
+    effects: { "config.mode": "live" },
+  }),
+  ".gitpp/records/claim.json": J({
+    id: "claim",
+    kind: "task",
+    parents: ["genesis"],
+    effects: { "config.mode": "claimed" },
+    reason: "claiming the mode",
+  }),
+};
+tarballs.set(AT1, tarball(ATT_FILES));
+at = posted.length;
+await push(ATTREPO, "refs/heads/main", AT1, undefined, attEnv);
+await push(ATTREPO, "refs/heads/main", AT1, undefined, plainEnv);
+{
+  const checks = stateChecks(at);
+  eq(checks.length, 2, "S25: both derivations post (signed, then unsigned)");
+  const signed = checks[0]?.output.text ?? "";
+  const unsigned = checks[1]?.output.text ?? "";
+  const sLines = signed.split("\n");
+  const attIdx = sLines.findIndex((l) => l === "## Attestation");
+  const qualIdx = sLines.findIndex((l) => l.startsWith("> Mechanical resolution"));
+  const attField = (name) => {
+    const line = sLines.find((l) => l.startsWith(`- ${name}: \``));
+    return line ? line.slice(`- ${name}: \``.length, -1) : null;
+  };
+  ok(
+    !unsigned.includes("## Attestation"),
+    "S25: with no signing key the report carries no attestation section",
+  );
+  ok(attIdx > 0, "S25: with a signing key the Check carries an attestation section");
+  ok(
+    attIdx > 0 && qualIdx > attIdx && sLines[qualIdx - 1] === "",
+    "S25: the attestation section sits above the closing qualifications",
+  );
+  ok(
+    sLines[qualIdx - 2]?.startsWith("- signature: `"),
+    "S25: the signature is the last line of the attestation section",
+  );
+  const appId = attField("app id");
+  const head = attField("head");
+  const keyId = attField("key id");
+  const recDigest = attField("records");
+  const repDigest = attField("report");
+  const signature = attField("signature");
+  eq(appId, String(app.id), "S25: the section names the App's id");
+  eq(head, AT1, "S25: the section names the head commit");
+  eq(
+    keyId,
+    createHash("sha256").update(attPubRaw).digest("hex").slice(0, 8),
+    "S25: the key id is the first 8 hex chars of the public key's SHA-256",
+  );
+  // The format pin: the signature must verify over exactly this
+  // canonical string, rebuilt here from the section's own fields.
+  const canonical = [
+    "git.pp/attestation/v1",
+    `app: ${appId}`,
+    `head: ${head}`,
+    `records: ${recDigest}`,
+    `report: ${repDigest}`,
+  ].join("\n");
+  ok(
+    cryptoVerify(
+      null,
+      Buffer.from(canonical, "utf8"),
+      attKeys.publicKey,
+      Buffer.from(signature ?? "", "base64"),
+    ),
+    "S25: the signature verifies over the canonical attestation string",
+  );
+  ok(
+    !cryptoVerify(
+      null,
+      Buffer.from(
+        canonical.replace(/records: [0-9a-f]{64}/, `records: ${"0".repeat(64)}`),
+        "utf8",
+      ),
+      attKeys.publicKey,
+      Buffer.from(signature ?? "", "base64"),
+    ),
+    "S25: a tampered attestation string does not verify",
+  );
+  // The two digests, pinned to what they claim to be.
+  const gated = [];
+  const rejects = [];
+  const entries = [];
+  for (const [p, t] of Object.entries(ATT_FILES)) {
+    if (p.startsWith(".gitpp/records/"))
+      api.gateRecordFile(t, p, gated, rejects, entries);
+  }
+  eq(
+    recDigest,
+    api.buildFrontierCheckpoint(gated).closureRoot,
+    "S25: the records digest is the engine's own input digest over the folded records",
+  );
+  eq(
+    repDigest,
+    createHash("sha256").update(Buffer.from(unsigned, "utf8")).digest("hex"),
+    "S25: the report digest is the digest of the report text",
+  );
+  eq(
+    stripAttestation(signed),
+    unsigned,
+    "S25: the signed report minus its section is byte-identical to the unsigned report",
+  );
+}
+
+// ---- S26: the surface Check is attested too ------------------------------------
+at = posted.length;
+await push(REPO2, "refs/heads/gitpp/state", TIP_D, "2026-10-20T09:14:00Z", attEnv);
+{
+  const sc = surfaceChecks(at);
+  eq(sc.length, 1, "S26: the surface Check posts with the signing key");
+  const text = sc[0]?.output.text ?? "";
+  ok(
+    text.includes("## Attestation"),
+    "S26: the surface Check carries an attestation section too",
+  );
+  const sLines = text.split("\n");
+  const attField = (name) => {
+    const line = sLines.find((l) => l.startsWith(`- ${name}: \``));
+    return line ? line.slice(`- ${name}: \``.length, -1) : null;
+  };
+  const canonical = [
+    "git.pp/attestation/v1",
+    `app: ${attField("app id")}`,
+    `head: ${attField("head")}`,
+    `records: ${attField("records")}`,
+    `report: ${attField("report")}`,
+  ].join("\n");
+  ok(
+    cryptoVerify(
+      null,
+      Buffer.from(canonical, "utf8"),
+      attKeys.publicKey,
+      Buffer.from(attField("signature") ?? "", "base64"),
+    ),
+    "S26: the surface attestation verifies over the same canonical string",
+  );
+  eq(attField("head"), TIP_D, "S26: the surface attestation names the head commit");
+  ok(
+    text.trimEnd().endsWith("The surface is what its records say."),
+    "S26: the surface qualifications still close the Check, after the attestation",
+  );
+}
+
+// ---- S27: a half-configured key signs nothing, and says so --------------------
+// A signing secret without its public key cannot name itself: the key
+// id is the public key's digest. Signing under it would publish a
+// receipt no verifier could check. So the Check goes out unsigned and
+// the operator is told, in the ring, by name.
+const HALFREPO = "acme/ferry-halfkey";
+const HK1 = "d4".repeat(20);
+tarballs.set(HK1, tarball(ATT_FILES));
+const halfEnv = {
+  CREDS: new KVStub(),
+  ATTESTATION_KEY: attPrivB64, // no ATTESTATION_PUBLIC_KEY
+};
+at = posted.length;
+await push(HALFREPO, "refs/heads/main", HK1, undefined, halfEnv);
+{
+  const checks = stateChecks(at);
+  eq(checks.length, 1, "S27: the Check still posts with a half-configured key");
+  const text = checks[0]?.output.text ?? "";
+  ok(
+    !text.includes("## Attestation"),
+    "S27: a half-configured key signs nothing",
+  );
+  ok(
+    halfEnv.CREDS.putLog.some(
+      (p) =>
+        p.k.startsWith("evt:") &&
+        String(p.v ?? "").includes("attestation-misconfigured"),
+    ),
+    "S27: the misconfiguration is named in the ring, never silent",
+  );
+}
+
+// ---- S28: the attestation yields to the report's content ----------------------
+// The byte budget is GitHub's: 65,536 bytes for the whole Check. When
+// the section does not fit, the SECTION goes — whole — and the report's
+// content is never sacrificed to keep the receipt.
+const BIGREPO = "acme/ferry-big";
+const BIG1 = "e5".repeat(20);
+const bigFiles = { ".gitpp/project.json": J({ project: "big" }) };
+for (let i = 0; i < 4000; i++) {
+  bigFiles[`.gitpp/records/r${String(i).padStart(5, "0")}.json`] = J({
+    id: `r${String(i).padStart(5, "0")}`,
+    kind: "task",
+    parents: [],
+    effects: { [`config.key.number.${String(i).padStart(5, "0")}`]: "v" },
+  });
+}
+tarballs.set(BIG1, tarball(bigFiles));
+at = posted.length;
+await push(BIGREPO, "refs/heads/main", BIG1, undefined, attEnv);
+{
+  const checks = stateChecks(at);
+  eq(checks.length, 1, "S28: the big Check posts");
+  const text = checks[0]?.output.text ?? "";
+  ok(
+    Buffer.byteLength(text, "utf8") <= 65000,
+    "S28: the Check stays inside the 65,000-byte budget",
+  );
+  ok(
+    !text.includes("## Attestation"),
+    "S28: the section is dropped whole when it does not fit — never in part",
+  );
+  ok(
+    text.includes("truncated in this view"),
+    "S28: the report's own truncation is still marked in place",
+  );
+}
+
+// ---- S29: the verifier checks a real repository, end to end ------------------
+// The verifier is a deliverable of its own: it re-folds the records at
+// a commit with the vendored engine and checks the signature. This
+// drives it against a real git repository (a throwaway one, committed
+// here) over the same records the Check was derived from.
+{
+  const dir = mkdtempSync(join(tmpdir(), "gitpp-attest-"));
+  const run = (args, cwd = dir) =>
+    spawnSync(args[0], args.slice(1), { cwd, encoding: "utf8" });
+  const gitOk = run(["git", "init", "-q"]).status === 0;
+  if (gitOk) {
+    for (const [p, t] of Object.entries(ATT_FILES)) {
+      const full = join(dir, p);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, t);
+    }
+    run(["git", "add", "-A"]);
+    run([
+      "git",
+      "-c",
+      "user.email=harness@example.com",
+      "-c",
+      "user.name=harness",
+      "commit",
+      "-qm",
+      "records",
+    ]);
+    const sha = run(["git", "rev-parse", "HEAD"]).stdout.trim();
+    const pubFile = join(dir, "attestation-key.pub");
+    writeFileSync(pubFile, `# harness key\n${attPubRaw.toString("base64")}\n`);
+    // Derive the same records at the same commit, with the signing key.
+    tarballs.set(sha, tarball(ATT_FILES));
+    at = posted.length;
+    await push("acme/ferry-verify", "refs/heads/main", sha, undefined, attEnv);
+    const check = stateChecks(at)[0]?.output.text ?? "";
+    const checkFile = join(dir, "check.txt");
+    writeFileSync(checkFile, check);
+    const script = fileURLToPath(
+      new URL("./scripts/verify-attestation.mjs", import.meta.url),
+    );
+    const good = run([
+      process.execPath,
+      script,
+      "--repo",
+      dir,
+      "--commit",
+      sha,
+      "--pub",
+      pubFile,
+      "--block",
+      checkFile,
+      "--quiet",
+    ]);
+    eq(good.status, 0, "S29: the verifier accepts a genuine attestation");
+    ok(
+      (good.stdout ?? "").startsWith("VERIFIED —"),
+      "S29: the verifier's verdict is one VERIFIED line",
+    );
+    // A record edited after the fact must not verify.
+    const recordPath = join(dir, ".gitpp/records/claim.json");
+    const edited = JSON.parse(readFileSync(recordPath, "utf8"));
+    edited.effects["config.mode"] = "edited";
+    writeFileSync(recordPath, JSON.stringify(edited));
+    run(["git", "add", "-A"]);
+    run([
+      "git",
+      "-c",
+      "user.email=harness@example.com",
+      "-c",
+      "user.name=harness",
+      "commit",
+      "-qm",
+      "edit",
+    ]);
+    const sha2 = run(["git", "rev-parse", "HEAD"]).stdout.trim();
+    const edited2 = run([
+      process.execPath,
+      script,
+      "--repo",
+      dir,
+      "--commit",
+      sha2,
+      "--pub",
+      pubFile,
+      "--block",
+      checkFile,
+      "--quiet",
+    ]);
+    eq(edited2.status, 1, "S29: the verifier rejects an attestation whose records were edited");
+    ok(
+      (edited2.stdout ?? "").startsWith("FAILED —"),
+      "S29: the verdict is one FAILED line",
+    );
+  } else {
+    // No git here: the drill cannot run. The four checks are reported
+    // as skipped rather than dropped, so the suite's assertion count
+    // is the same wherever it runs.
+    ok(true, "S29: the verifier accepts a genuine attestation (skipped: no git)");
+    ok(true, "S29: the verifier's verdict is one VERIFIED line (skipped: no git)");
+    ok(true, "S29: the verifier rejects an attestation whose records were edited (skipped: no git)");
+    ok(true, "S29: the verdict is one FAILED line (skipped: no git)");
+  }
+  rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
