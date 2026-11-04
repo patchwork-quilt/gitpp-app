@@ -1,4 +1,4 @@
-# Contest day — the M2 live-day receipt
+# Contest day — the live-day receipt
 
 **The day:** 2026-10-23, in `SuperInstance/gitpp-dogfood-day1`. Five agents
 wrote colliding git.pp records on five branches of one repository; a referee
