@@ -4,6 +4,18 @@ All notable changes to gitpp-app. Versions name this repository's
 mainline; a version is tagged only when the tagged tree is the
 deployed Worker (see the 0.1.0 note).
 
+## [0.4.1] — 2026-11-03
+
+- **Report-digest canonical form.** The attestation's report digest
+  now covers the report text with trailing newlines stripped, on both
+  the Worker's side and the verifier's — GitHub stores and returns a
+  Check's output text without the trailing newline the Worker wrote,
+  so the unstripped digest never verified against retrieved text. The
+  rule is defined in `docs/SIGNING.md`; a suite case pins digest
+  stability across the difference. Found by live end-to-end
+  verification of the first signed Check (signature and records
+  digest verified; report digest did not). Suite: 186 passed.
+
 ## [0.4.0] — 2026-11-03
 
 The record gets signed: every derivation carries an attestation.
