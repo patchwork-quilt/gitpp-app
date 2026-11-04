@@ -22,10 +22,20 @@ The record gets signed: every derivation carries an attestation.
   against itself before signing; a mismatched pair signs nothing and
   is named in the operator log. With no key configured, reports are
   byte-identical to 0.3.0.
-- Suite: 181 passed, 0 failed (152 at 0.3.0; the 29 new assertions pin
+- **The report digest's canonical form.** The report digest is taken
+  over the report text with its trailing newlines stripped. GitHub
+  stores and returns a Check's output text *without* the trailing
+  newline the Worker writes, so hashing the text exactly as written
+  produced a digest no reader could recompute — found live on
+  2026-11-03, where the signature and the records digest verified and
+  the report digest did not. The Worker and the verifier now apply the
+  same rule, so a Check read back from GitHub verifies exactly as one
+  read from the file the Worker wrote.
+- Suite: 186 passed, 0 failed (152 at 0.3.0; the 34 new assertions pin
   the attestation format, the sign/verify round trip, the
   byte-identical no-secret behaviour, the misconfigured key, the byte
-  budget, and the verifier end to end).
+  budget, the verifier end to end, and the report digest against the
+  text GitHub returns).
 
 ## [0.3.0] — 2026-11-02
 
