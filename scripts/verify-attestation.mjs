@@ -28,6 +28,13 @@
 // records live on the gitpp/state branch) still has its signature
 // verified here, and says so.
 //
+// The report digest is recomputed over the report text's CANONICAL
+// FORM — the text without the attestation section and without its
+// trailing newlines, because GitHub returns a Check's output text
+// without the trailing newline the Worker wrote (found live on
+// 2026-11-03). The Worker applies the same rule; see
+// docs/SIGNING.md, "The report digest".
+//
 // The canonical attestation string, as signed:
 //
 //   git.pp/attestation/v1
@@ -154,6 +161,15 @@ function readPublicKey(path) {
     .slice(0, 8);
   return { key, raw, keyId };
 }
+
+// ---- the report text's canonical form ----------------------------------------
+// The report digest is taken over the report text with its trailing
+// newlines stripped: GitHub stores and returns a Check run's output
+// text without the trailing newline the Worker wrote, so that is the
+// form both sides agree on. The Worker applies the same rule
+// (canonicalReportText() in worker.js). Only trailing newline
+// characters are stripped — every other byte of the text is covered.
+const canonicalReportText = (text) => text.replace(/\n+$/, "");
 
 // ---- the attestation block ----------------------------------------------------
 // The block is the `## Attestation` section's bullets. The whole Check
@@ -344,7 +360,7 @@ async function main() {
 
   // 3. the report digest, when the whole Check output was given
   if (block.whole && block.body !== null) {
-    const reportDigest = engine.sha256Hex(block.body);
+    const reportDigest = engine.sha256Hex(canonicalReportText(block.body));
     if (reportDigest !== block.report)
       return fail(
         `the report digest does not match the report text: the block says ${block.report.slice(0, 16)}…, the text gives ${reportDigest.slice(0, 16)}…`,

@@ -1700,6 +1700,18 @@ function stripAttestation(text) {
   return text.slice(0, i) + text.slice(j);
 }
 
+/** One field of an attestation section, by name. */
+function attFieldOf(text, name) {
+  const line = text.split("\n").find((l) => l.startsWith(`- ${name}: \``));
+  return line ? line.slice(`- ${name}: \``.length, -1) : null;
+}
+
+/** The report digest's canonical form: the report text with its
+ *  trailing newlines stripped. GitHub stores and returns a Check's
+ *  output text without the trailing newline the Worker wrote, so the
+ *  digest is taken over the form both sides agree on. */
+const canonicalReportText = (text) => text.replace(/\n+$/, "");
+
 const ATTREPO = "acme/ferry-att";
 const AT1 = "c3".repeat(20);
 const ATT_FILES = {
@@ -1722,11 +1734,13 @@ tarballs.set(AT1, tarball(ATT_FILES));
 at = posted.length;
 await push(ATTREPO, "refs/heads/main", AT1, undefined, attEnv);
 await push(ATTREPO, "refs/heads/main", AT1, undefined, plainEnv);
+let signedAttCheck = "";
 {
   const checks = stateChecks(at);
   eq(checks.length, 2, "S25: both derivations post (signed, then unsigned)");
   const signed = checks[0]?.output.text ?? "";
   const unsigned = checks[1]?.output.text ?? "";
+  signedAttCheck = signed;
   const sLines = signed.split("\n");
   const attIdx = sLines.findIndex((l) => l === "## Attestation");
   const qualIdx = sLines.findIndex((l) => l.startsWith("> Mechanical resolution"));
@@ -1805,8 +1819,10 @@ await push(ATTREPO, "refs/heads/main", AT1, undefined, plainEnv);
   );
   eq(
     repDigest,
-    createHash("sha256").update(Buffer.from(unsigned, "utf8")).digest("hex"),
-    "S25: the report digest is the digest of the report text",
+    createHash("sha256")
+      .update(Buffer.from(canonicalReportText(unsigned), "utf8"))
+      .digest("hex"),
+    "S25: the report digest is the digest of the report text (trailing newlines stripped)",
   );
   eq(
     stripAttestation(signed),
@@ -1980,6 +1996,28 @@ await push(BIGREPO, "refs/heads/main", BIG1, undefined, attEnv);
       (good.stdout ?? "").startsWith("VERIFIED —"),
       "S29: the verifier's verdict is one VERIFIED line",
     );
+    // The text GitHub stores has no trailing newline: the verifier
+    // must still accept the attestation as it comes back.
+    const retrievedFile = join(dir, "check-retrieved.txt");
+    writeFileSync(retrievedFile, check.replace(/\n+$/, ""));
+    const retrieved = run([
+      process.execPath,
+      script,
+      "--repo",
+      dir,
+      "--commit",
+      sha,
+      "--pub",
+      pubFile,
+      "--block",
+      retrievedFile,
+      "--quiet",
+    ]);
+    eq(
+      retrieved.status,
+      0,
+      "S29: the verifier accepts the Check text as GitHub returns it (no trailing newline)",
+    );
     // A record edited after the fact must not verify.
     const recordPath = join(dir, ".gitpp/records/claim.json");
     const edited = JSON.parse(readFileSync(recordPath, "utf8"));
@@ -2025,6 +2063,43 @@ await push(BIGREPO, "refs/heads/main", BIG1, undefined, attEnv);
     ok(true, "S29: the verdict is one FAILED line (skipped: no git)");
   }
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ---- S30: the report digest survives GitHub's round trip ---------------------
+// GitHub stores and returns a Check's output text WITHOUT the trailing
+// newline the Worker wrote. The report digest is therefore taken over
+// the canonical form — the report text with its trailing newlines
+// stripped — so that a reader who recomputes it from the text GitHub
+// hands back gets the digest the Check carries. This is the case a
+// live check found: the signature and the records digest verified,
+// and the report digest did not, because the Worker had hashed the
+// newline it never got back.
+{
+  const posted = signedAttCheck;
+  const retrieved = posted.replace(/\n+$/, "");
+  ok(
+    retrieved !== posted,
+    "S30: the text GitHub returns differs from the text the Worker posted (no trailing newline)",
+  );
+  const repDigest = attFieldOf(posted, "report");
+  eq(
+    createHash("sha256")
+      .update(Buffer.from(canonicalReportText(stripAttestation(retrieved)), "utf8"))
+      .digest("hex"),
+    repDigest,
+    "S30: the report digest is the digest of the retrieved report text",
+  );
+  ok(
+    createHash("sha256")
+      .update(Buffer.from(stripAttestation(posted), "utf8"))
+      .digest("hex") !== repDigest,
+    "S30: the trailing newline is not part of the digest",
+  );
+  eq(
+    attFieldOf(retrieved, "report"),
+    repDigest,
+    "S30: the section itself survives the round trip unchanged",
+  );
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

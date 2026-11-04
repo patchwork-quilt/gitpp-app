@@ -14,12 +14,13 @@
 # MEASURED baseline, 2026-11-03, node v22.23.3, on a clean clone with
 # the fixture in place:
 #
-#   $ node surface.test.mjs   ->  "181 passed, 0 failed", exit 0
+#   $ node surface.test.mjs   ->  "186 passed, 0 failed", exit 0
 #
-# (152 before the derivation attestation landed — S25 through S29 add
-# 29: the attestation's format, the sign/verify round trip, the
+# (152 before the derivation attestation landed — S25 through S30 add
+# 34: the attestation's format, the sign/verify round trip, the
 # byte-identical no-secret behaviour, the misconfigured key, the byte
-# budget, and the verifier end to end.)
+# budget, the verifier end to end, and the report digest's canonical
+# form against the text GitHub returns.)
 #
 # The assert step requires the pass line to exist and the count to be
 # at least the measured baseline: a suite that silently shrinks, or
@@ -55,7 +56,7 @@ jobs:
     env:
       # Measured baseline — see the header. A count below this means
       # the suite shrank, was truncated, or stopped running.
-      MIN_PASSED: '181'
+      MIN_PASSED: '186'
     steps:
       - uses: actions/checkout@v4
 

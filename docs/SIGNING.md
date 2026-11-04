@@ -108,9 +108,35 @@ the surface fold consumed — plus the proposals in a preview.
 ### The report digest — the digest of what the reader reads
 
 `sha256Hex()` over the UTF-8 bytes of the report text as posted, with
-the attestation section itself removed. It is therefore the digest of
-exactly the text a reader sees in the Check, minus the receipt about
-that text.
+
+- the attestation section itself removed, and
+- the text's **trailing newlines stripped**.
+
+That second rule is the *canonical form* of the report text, and it
+exists because of what GitHub does with a Check's output: the Worker
+writes the text with a trailing newline, GitHub stores and returns it
+**without** that newline. Hashing the text exactly as written
+therefore produced a digest that no reader could recompute from the
+text GitHub hands back — the signature and the records digest
+verified, and the report digest did not. That was found live, on
+2026-11-03, and fixed the same day.
+
+So the digest is taken over the form both sides agree on: the report
+text, minus the section, minus the trailing newline(s). The Worker
+applies the rule in `canonicalReportText()`; the verifier applies the
+same one when it recomputes the digest. Only trailing newline
+characters are stripped — every other byte of the report is still
+covered, and the digest still changes if any character of the report
+changes.
+
+In code, the canonical form of a report `T` is:
+
+```
+canonical(T) = T without its trailing "\n" characters
+```
+
+and the report digest is `sha256Hex(canonical(report text without the
+attestation section))`.
 
 ## The algorithm, and where the keys live
 
@@ -251,7 +277,9 @@ The verifier does three things, and says which ones it did:
    verdict is `FAILED`.
 3. **It recomputes the report digest**, but only when it was given the
    whole Check output — the block alone does not carry the text the
-   digest covers.
+   digest covers. The text it hashes is the canonical form (trailing
+   newlines stripped), so a Check read back from GitHub verifies
+   exactly as one read from the file the Worker wrote.
 
 Exit status is `0` when the attestation verifies as far as it could be
 checked, `1` when it does not; the verdict is one line on stdout:

@@ -1691,7 +1691,9 @@ function witnessFreshness(records) {
 // job, and we do not touch the vendored bytes to get it: the harness
 // pins attestationRecordsDigest() to checkpointRoot()'s value. The
 // report digest is sha256Hex() over the report text as posted, minus
-// the attestation section itself.
+// the attestation section itself and with its trailing newlines
+// stripped — the canonical form, because GitHub returns the text
+// without the newline the Worker wrote (canonicalReportText()).
 //
 // KEY CUSTODY. The private key is the Worker secret ATTESTATION_KEY
 // (base64 PKCS#8); it is never written to the repo, never logged, and
@@ -1846,6 +1848,26 @@ async function attestationKeyPair(env) {
   }
 }
 
+/** The report digest's canonical form: the report text with its
+ *  trailing newlines stripped.
+ *
+ *  GitHub stores and returns a Check run's output text WITHOUT the
+ *  trailing newline the Worker wrote — the newline is the Worker's,
+ *  not GitHub's, and it does not survive the round trip. Hashing the
+ *  text as written therefore produced a digest that no reader could
+ *  ever recompute from the text GitHub hands back: the signature and
+ *  the records digest verified, and the report digest did not (found
+ *  live, 2026-11-03). So the digest is taken over the canonical form —
+ *  the text both sides agree on — and both the Worker and the
+ *  verifier apply the same rule.
+ *
+ *  Only trailing newline characters are stripped. Nothing else about
+ *  the text is touched: the digest still covers every byte a reader
+ *  sees. */
+function canonicalReportText(text) {
+  return String(text).replace(/\n+$/, "");
+}
+
 /** Build the attestation for one rendered report. Returns null when
  *  signing is not configured; {error} when it is configured but broken
  *  (the caller logs that — never silent). */
@@ -1855,7 +1877,7 @@ async function buildAttestation(env, app, { head, records, orphanIds, reportText
   if (pair.error) return { error: pair.error };
   const appId = String(app?.id ?? app?.slug ?? "unknown");
   const recordsDigest = attestationRecordsDigest(records, orphanIds);
-  const reportDigest = sha256Hex(reportText);
+  const reportDigest = sha256Hex(canonicalReportText(reportText));
   const string = attestationString({
     appId,
     head,
