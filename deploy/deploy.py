@@ -56,6 +56,14 @@ def main():
     import urllib.request, urllib.error, uuid as _uuid
     binds = [{"name": kv["binding"], "type": "kv_namespace", "namespace_id": kv["id"]}
              for kv in metadata.get("kv_namespaces", [])]
+    # The attestation bindings ride along (learned 2026-11-03: a plain
+    # settings PATCH from this script dropped ATTESTATION_PUBLIC_KEY,
+    # and the Worker fail-closed into not signing). The public key is
+    # public material (docs/attestation-key.pub, key id 39ba770e); the
+    # secret is re-declared by name only, which keeps its stored value.
+    binds.append({"name": "ATTESTATION_PUBLIC_KEY", "type": "plain_text",
+                  "text": "6RzvHBu0G2wUv2xtQXgayKq5uORAtw8hG1EkZ5JaXYk="})
+    binds.append({"name": "ATTESTATION_KEY", "type": "secret_text"})
     if binds:
         tok = cf_oauth.access_token()
         boundary = "----cfpatch" + _uuid.uuid4().hex
