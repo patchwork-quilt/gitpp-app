@@ -53,6 +53,11 @@
   day; 5 branch Checks + 5 merge Checks, each matched an
   independent local fold of the same records exactly. Record:
   gitpp-app `README.md` / `docs/evidence/`.
+- **Signed derivations.** Every Check carries an Ed25519
+  attestation over the exact record set it folded and the report
+  it posted, verifiable with a dependency-free script against the
+  published key — what it proves and what it does not is stated
+  plainly in the signing documentation.
 - **Legibility 94.4%** (8.5/9) — cold readers predicting winners,
   values, and losers from the Check text, re-measured after the
   first pass's 88.9% miss and its fixes.

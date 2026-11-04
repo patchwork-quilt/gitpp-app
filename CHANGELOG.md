@@ -4,6 +4,29 @@ All notable changes to gitpp-app. Versions name this repository's
 mainline; a version is tagged only when the tagged tree is the
 deployed Worker (see the 0.1.0 note).
 
+## [0.4.0] — 2026-11-03
+
+The record gets signed: every derivation carries an attestation.
+
+- **Derivation attestation.** Each `git.pp state` and `git.pp surface`
+  Check the App posts carries an `## Attestation` section: an Ed25519
+  signature over a canonical string binding the App's id, the head
+  commit, the engine's own digest of the exact record set folded, and
+  a digest of the report itself. The private key is a Worker secret;
+  the public key is published (`docs/attestation-key.pub`, production
+  key id `39ba770e`). Design and honest scope: `docs/SIGNING.md`.
+- **A standalone verifier.** `scripts/verify-attestation.mjs` (node
+  builtins only) re-folds a repository's records at a commit and
+  checks a Check's attestation against the published key.
+- **Fail-closed key handling.** The Worker checks the configured pair
+  against itself before signing; a mismatched pair signs nothing and
+  is named in the operator log. With no key configured, reports are
+  byte-identical to 0.3.0.
+- Suite: 181 passed, 0 failed (152 at 0.3.0; the 29 new assertions pin
+  the attestation format, the sign/verify round trip, the
+  byte-identical no-secret behaviour, the misconfigured key, the byte
+  budget, and the verifier end to end).
+
 ## [0.3.0] — 2026-11-02
 
 M3 gate-closing: the delivery log is operator-only, the two

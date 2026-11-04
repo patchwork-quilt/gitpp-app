@@ -82,6 +82,11 @@ holds expires on the schedule above.
   winning and losing record ids, and the ancestry that decided —
   posted to the commit it derived from. This is the App's output
   and its purpose.
+  When the operator has configured signing, a Check also carries
+  an Attestation section — two digests and an Ed25519 signature
+  over the derivation (see `docs/SIGNING.md` in the App's
+  repository). It is a public receipt that this App produced
+  that derivation; it contains no user data.
 - **API calls to GitHub**: installation-token requests, the
   tarball fetch, and check-run lookups/posts above.
 - **No other disclosure.** The App sells nothing, shares nothing
